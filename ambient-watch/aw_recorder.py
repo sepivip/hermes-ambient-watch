@@ -1,12 +1,13 @@
-"""Recorder: the pre_gateway_dispatch decision.
+"""Recorder: the pre_gateway_dispatch decision (Tier 0 — zero LLM/tools).
 
-Tier 0 of the design: zero LLM, zero tools. Decides, per incoming
-MessageEvent, whether ambient-watch records it, and whether normal
-dispatch continues (PASS) or stops (SKIP).
+Adversarial-review corrections encoded here:
+- Slash-command events PASS (second MessageEvent shape, adapter.py:7753).
+- Mentions are detected in flat text AND Block Kit blocks (#52387),
+  skipping rich_text_quote subtrees (quoted mentions are not mentions).
+- Replies in threads we nudged PASS + record engagement + retire the
+  intent (feedback loop for self-quiet; conversation continuation).
 
-Fail-safe invariant: an internal error must never fail open (dispatching
-un-mentioned free_response traffic to the agent) and must never eat a
-genuine mention.
+Fail-safe invariant: never fail open, never eat a genuine mention.
 """
 
 from __future__ import annotations
@@ -28,17 +29,42 @@ def _channel_of(event) -> str:
     return meta.get("slack_channel_id") or getattr(event.source, "chat_id", "") or ""
 
 
+def _is_slash_command(event) -> bool:
+    mt = getattr(event, "message_type", None)
+    if getattr(mt, "name", "") == "COMMAND" or getattr(mt, "value", "") == "command":
+        return True
+    raw = getattr(event, "raw_message", None)
+    return isinstance(raw, dict) and "command" in raw and "ts" not in raw
+
+
+def _blocks_mention(blocks, bot_user_id: str) -> bool:
+    """Recursive Block Kit walk; rich_text_quote subtrees are skipped."""
+    if not isinstance(blocks, list):
+        return False
+    for el in blocks:
+        if not isinstance(el, dict):
+            continue
+        if el.get("type") == "rich_text_quote":
+            continue
+        if el.get("type") == "user" and el.get("user_id") == bot_user_id:
+            return True
+        if _blocks_mention(el.get("elements"), bot_user_id):
+            return True
+    return False
+
+
 def _is_mention(event, bot_user_id: str) -> bool:
     needle = f"<@{bot_user_id}>"
-    raw = getattr(event, "raw_message", None) or {}
-    raw_text = raw.get("text") or "" if isinstance(raw, dict) else ""
-    return needle in (event.text or "") or needle in raw_text
+    raw = getattr(event, "raw_message", None)
+    raw = raw if isinstance(raw, dict) else {}
+    if needle in (event.text or "") or needle in (raw.get("text") or ""):
+        return True
+    return _blocks_mention(raw.get("blocks"), bot_user_id)
 
 
 def _is_bot(event, bot_user_id: str) -> bool:
-    raw = getattr(event, "raw_message", None) or {}
-    if not isinstance(raw, dict):
-        raw = {}
+    raw = getattr(event, "raw_message", None)
+    raw = raw if isinstance(raw, dict) else {}
     author = raw.get("user") or getattr(event, "user_id", None)
     return bool(raw.get("bot_id")) or raw.get("subtype") == "bot_message" or (
         author is not None and author == bot_user_id
@@ -53,6 +79,8 @@ def decide(event, cfg, store) -> Decision:
     if str(platform) != "slack":
         return Decision.PASS
     if getattr(source, "chat_type", "") == "dm":
+        return Decision.PASS
+    if _is_slash_command(event):
         return Decision.PASS
     channel = _channel_of(event)
     if channel not in cfg.channels:
@@ -86,13 +114,18 @@ def decide(event, cfg, store) -> Decision:
         if mention:
             return Decision.RECORD_PASS
         if thread_ts and store.is_engaged(channel, thread_ts):
-            # Preserve stock thread-following: once the bot was mentioned in
-            # a thread, later un-mentioned replies still reach the agent.
+            return Decision.RECORD_PASS
+        if thread_ts and store.has_intervention(channel, thread_ts):
+            # A human replied in a thread we nudged: engagement feedback for
+            # self-quiet, retire the intent, and let the conversation flow —
+            # stock Hermes would dispatch replies to bot-participated threads.
+            store.record_engagement(channel, thread_ts)
+            store.mark_intent_done(f"{channel}:{thread_ts}")
+            store.mark_engaged(channel, thread_ts)
             return Decision.RECORD_PASS
         return Decision.RECORD_SKIP
     except Exception:
         logger.exception("ambient-watch recorder failed; applying fail-safe")
-        # Fail safe: never fail open, never eat a real mention.
         if mention and not is_bot:
             return Decision.RECORD_PASS
         return Decision.RECORD_SKIP

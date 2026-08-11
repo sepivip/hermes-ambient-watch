@@ -1,17 +1,16 @@
 """Shared fixtures for ambient-watch tests.
 
 Fakes mirror the contracts verified against hermes-agent v0.20.0
-(commit c0106e5, 2026-08-11):
+(commit c0106e5, 2026-08-11), corrected per adversarial review:
 
-- MessageEvent: text, message_id (= Slack ts), user_id, source
-  (SessionSource: platform, user_id, chat_id, user_name, chat_type),
-  raw_message (raw Slack event dict), reply_to_message_id
-  (= thread_ts when in a thread), metadata {slack_team_id,
-  slack_channel_id, slack_thread_ts}.
-- pre_gateway_dispatch: kwargs event/gateway/session_store, returns
-  {"action": "skip"|"rewrite"|"allow"} or None.
-- pre_tool_call: kwargs tool_name/args/..., returns
-  {"action": "block", "message": str} to block.
+- MessageEvent: text, message_type, message_id (= Slack ts), user_id,
+  source (platform, user_id, chat_id, user_name, chat_type), raw_message
+  (raw Slack event dict, may contain Block Kit "blocks"), metadata.
+- Slash commands produce a second shape: chat_type="group", no metadata,
+  raw_message = slash payload with "command" key and NO "ts".
+- send_message tool targets are "slack:C…:<thread_ts>" — PLATFORM PREFIX
+  FIRST (tools/send_message_tool.py _handle_send splits platform:ref).
+- Cron scripts are path-jailed to HERMES_HOME/scripts/.
 """
 
 import sys
@@ -20,8 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
-# Make the plugin modules importable without a Hermes install.
-PLUGIN_DIR = Path(__file__).resolve().parent.parent
+PLUGIN_DIR = Path(__file__).resolve().parent.parent / "ambient-watch"
 if str(PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(PLUGIN_DIR))
 
@@ -33,12 +31,11 @@ WATCHED = "C0WATCHED1"
 UNWATCHED = "C0ELSEWHER"
 
 
-@pytest.fixture
-def cfg(tmp_path):
+def _make_cfg(tmp_path, mode):
     return AmbientConfig(
         bot_user_id=BOT_ID,
         channels={WATCHED},
-        mode="shadow",
+        mode=mode,
         ops_channel="C0AMBOPS11",
         data_dir=tmp_path,
         unanswered_after_minutes=45,
@@ -51,6 +48,16 @@ def cfg(tmp_path):
         quiet_end="09:00",
         quiet_tz="Asia/Tbilisi",
     )
+
+
+@pytest.fixture
+def cfg(tmp_path):
+    return _make_cfg(tmp_path, "shadow")
+
+
+@pytest.fixture
+def live_cfg(tmp_path):
+    return _make_cfg(tmp_path, "live")
 
 
 @pytest.fixture
@@ -70,8 +77,9 @@ def make_event(
     chat_type="channel",
     bot_id=None,
     subtype=None,
+    blocks=None,
+    message_type=None,
 ):
-    """Build a MessageEvent-shaped fake matching the Slack adapter's output."""
     raw = {"ts": ts, "channel": channel, "user": user, "text": text}
     if thread_ts:
         raw["thread_ts"] = thread_ts
@@ -79,8 +87,11 @@ def make_event(
         raw["bot_id"] = bot_id
     if subtype:
         raw["subtype"] = subtype
+    if blocks is not None:
+        raw["blocks"] = blocks
     return SimpleNamespace(
         text=text,
+        message_type=message_type,
         message_id=ts,
         user_id=user,
         user_name="tester",
@@ -99,4 +110,26 @@ def make_event(
             "slack_channel_id": channel,
             "slack_thread_ts": thread_ts or ts,
         },
+    )
+
+
+def make_slash_event(channel=WATCHED, text="/hermes status"):
+    """Mirror adapter.py:7753 — slash payload: no ts/thread_ts/user keys."""
+    return SimpleNamespace(
+        text=text,
+        message_type=SimpleNamespace(name="COMMAND", value="command"),
+        message_id=None,
+        user_id="U0HUMAN001",
+        user_name="tester",
+        internal=False,
+        source=SimpleNamespace(
+            platform=SimpleNamespace(value="slack"),
+            user_id="U0HUMAN001",
+            chat_id=channel,
+            user_name="tester",
+            chat_type="group",
+        ),
+        raw_message={"command": "/hermes", "channel_id": channel, "text": text},
+        reply_to_message_id=None,
+        metadata={},
     )

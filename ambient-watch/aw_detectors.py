@@ -81,7 +81,10 @@ def find_candidates(store, cfg, now: float) -> list[Candidate]:
         if store.interventions_since(channel, day_ago) >= cfg.caps_per_channel_per_day:
             continue
 
+        channel_found = False
         for root in store.thread_roots(channel):
+            if channel_found:
+                break  # at most ONE candidate per channel per sweep
             root_ts = root["ts"]
             if root["is_bot"]:
                 continue
@@ -89,6 +92,8 @@ def find_candidates(store, cfg, now: float) -> list[Candidate]:
                 continue
             if store.has_intervention(channel, root_ts):
                 continue
+            if store.is_engaged(channel, root_ts):
+                continue  # the bot already converses there — never nudge
 
             msgs = store.thread_messages(channel, root_ts)
             human_replies = [
@@ -125,6 +130,7 @@ def find_candidates(store, cfg, now: float) -> list[Candidate]:
                     excerpt=excerpt,
                 )
             )
+            channel_found = True
 
     out.sort(key=lambda c: float(c.thread_ts))
     return out[: cfg.candidates_per_run]
