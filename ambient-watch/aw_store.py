@@ -216,6 +216,30 @@ class AmbientStore:
             )
             return cur.fetchone() is not None
 
+    # Shadow analogues of the intervention counters, so a soak reproduces the
+    # exact digest volume live mode would post (see test_shadow_simulates_caps).
+    def shadow_seen_since(self, channel, since) -> int:
+        with self._lock:
+            cur = self._db.execute(
+                "SELECT COUNT(*) c FROM shadow_seen WHERE channel=? AND created_at>=?",
+                (channel, since),
+            )
+            return cur.fetchone()["c"]
+
+    def global_shadow_seen_since(self, since) -> int:
+        with self._lock:
+            cur = self._db.execute(
+                "SELECT COUNT(*) c FROM shadow_seen WHERE created_at>=?", (since,)
+            )
+            return cur.fetchone()["c"]
+
+    def last_shadow_seen_at(self, channel):
+        with self._lock:
+            cur = self._db.execute(
+                "SELECT MAX(created_at) m FROM shadow_seen WHERE channel=?", (channel,)
+            )
+            return cur.fetchone()["m"]
+
     # -- mutes ------------------------------------------------------------
     def mute_thread(self, channel, thread_ts):
         with self._lock, self._db:

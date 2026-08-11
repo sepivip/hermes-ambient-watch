@@ -85,18 +85,28 @@ def test_at_most_one_candidate_per_channel_per_sweep(cfg, store):
     assert cands[0].thread_ts == f"{T0:.6f}"  # oldest first
 
 
-def test_per_channel_daily_cap_suppresses_candidates(cfg, store):
-    _seed(store, cfg, "unanswered?", T0)
+def test_per_channel_daily_cap_suppresses_candidates(live_cfg):
+    """Live mode gates on interventions. (Shadow's equivalent is covered by
+    test_shadow_simulates_caps, which gates on shadow_seen instead.)"""
+    from aw_store import AmbientStore
+
+    store = AmbientStore(live_cfg.data_dir / "ambient.db")
+    _seed(store, live_cfg, "unanswered?", T0)
     for i in range(3):
         store.record_intervention(WATCHED, f"{T0 + 100 + i:.6f}", kind="x", now=T0 + 200 + i)
-    assert find_candidates(store, cfg, now=T0 + 46 * 60 + 120 * 60) == []
+    assert find_candidates(store, live_cfg, now=T0 + 46 * 60 + 120 * 60) == []
+    store.close()
 
 
-def test_channel_cooldown_suppresses_candidates(cfg, store):
-    _seed(store, cfg, "first question?", T0)
+def test_channel_cooldown_suppresses_candidates(live_cfg):
+    from aw_store import AmbientStore
+
+    store = AmbientStore(live_cfg.data_dir / "ambient.db")
+    _seed(store, live_cfg, "first question?", T0)
     store.record_intervention(WATCHED, "1754800000.000000", kind="x", now=T0 + 45 * 60)
-    assert find_candidates(store, cfg, now=T0 + 46 * 60) == []
-    assert len(find_candidates(store, cfg, now=T0 + (46 + 120) * 60)) == 1
+    assert find_candidates(store, live_cfg, now=T0 + 46 * 60) == []
+    assert len(find_candidates(store, live_cfg, now=T0 + (46 + 120) * 60)) == 1
+    store.close()
 
 
 def test_quiet_hours_suppress_candidates(cfg, store):

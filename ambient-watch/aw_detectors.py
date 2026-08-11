@@ -68,7 +68,23 @@ def find_candidates(store, cfg, now: float) -> list[Candidate]:
     if _in_quiet_hours(cfg, now):
         return []
     day_ago = now - 86400
-    if store.global_interventions_since(day_ago) >= cfg.caps_global_per_day:
+
+    # Live gates on real interventions; shadow gates on its own shadow_seen
+    # ledger so a soak reproduces the digest volume live would actually post.
+    # Without this, shadow silently had NO cooldown and NO caps (interventions
+    # is empty by design), so the soak over-reported and precision tuning
+    # would be done against a volume live could never produce.
+    shadow = cfg.mode != "live"
+    if shadow:
+        global_since = store.global_shadow_seen_since
+        channel_since = store.shadow_seen_since
+        last_at = store.last_shadow_seen_at
+    else:
+        global_since = store.global_interventions_since
+        channel_since = store.interventions_since
+        last_at = store.last_intervention_at
+
+    if global_since(day_ago) >= cfg.caps_global_per_day:
         return []
 
     out: list[Candidate] = []
@@ -77,10 +93,10 @@ def find_candidates(store, cfg, now: float) -> list[Candidate]:
             continue  # someone muted the whole channel from Slack
         if store.channel_self_quieted(channel, cfg.self_quiet_after_ignored):
             continue
-        last = store.last_intervention_at(channel)
+        last = last_at(channel)
         if last is not None and (now - last) < cfg.cooldown_minutes * 60:
             continue
-        if store.interventions_since(channel, day_ago) >= cfg.caps_per_channel_per_day:
+        if channel_since(channel, day_ago) >= cfg.caps_per_channel_per_day:
             continue
 
         channel_found = False

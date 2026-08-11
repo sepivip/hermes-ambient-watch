@@ -62,6 +62,7 @@ def test_live_mode_does_not_use_shadow_seen(live_cfg):
 
 
 def test_new_thread_still_digested_after_a_seen_one(cfg, store):
+    cfg.cooldown_minutes = 0  # isolating dedupe from the cooldown gate
     _seed(store, cfg, "first question?", T0)
     run_gate(cfg, store, now=T0 + 46 * 60)
     _seed(store, cfg, "second unrelated question?", T0 + 60 * 60)
