@@ -232,6 +232,25 @@ class AmbientStore:
             )
             return cur.fetchone() is not None
 
+    def unmute_thread(self, channel, thread_ts):
+        with self._lock, self._db:
+            self._db.execute(
+                "DELETE FROM muted WHERE channel=? AND thread_ts=?",
+                (channel, thread_ts),
+            )
+
+    # A channel-wide mute is stored as the sentinel thread_ts '*'.
+    _CHANNEL_MUTE = "*"
+
+    def mute_channel(self, channel):
+        self.mute_thread(channel, self._CHANNEL_MUTE)
+
+    def unmute_channel(self, channel):
+        self.unmute_thread(channel, self._CHANNEL_MUTE)
+
+    def is_channel_muted(self, channel) -> bool:
+        return self.is_muted(channel, self._CHANNEL_MUTE)
+
     # -- intents (tool-guard arming) --------------------------------------
     def arm_intent(self, target, channel, thread_ts, now=None):
         # target may arrive platform-prefixed from gate candidates; store bare.

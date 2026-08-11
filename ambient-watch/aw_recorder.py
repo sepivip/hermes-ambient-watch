@@ -13,6 +13,7 @@ Fail-safe invariant: never fail open, never eat a genuine mention.
 from __future__ import annotations
 
 import logging
+import re
 from enum import Enum
 
 logger = logging.getLogger("ambient_watch")
@@ -22,6 +23,22 @@ class Decision(Enum):
     PASS = "pass"           # not ours — normal dispatch
     RECORD_SKIP = "skip"    # recorded; drop before auth/agent
     RECORD_PASS = "allow"   # recorded; continue to normal dispatch
+    RECORD_REWRITE = "rewrite"  # recorded; replace text so the agent confirms
+
+
+# In-channel control surface (Claude Tag parity). Anchored at the start of
+# the message — after an optional bot mention or '!' — so ordinary prose that
+# merely contains the word "mute" is never treated as a command.
+_MUTE_CMD = re.compile(
+    r"^\s*(?:<@[A-Z0-9]+>\s*|!)?\s*(?:hermes\s+)?ambient\s+(mute|unmute)\b",
+    re.IGNORECASE,
+)
+
+
+def _mute_command(text: str):
+    """Return 'mute' | 'unmute' | None for an ambient control message."""
+    m = _MUTE_CMD.match(text or "")
+    return m.group(1).lower() if m else None
 
 
 def _channel_of(event) -> str:
@@ -111,6 +128,27 @@ def decide(event, cfg, store) -> Decision:
 
         if is_bot:
             return Decision.RECORD_SKIP
+
+        cmd = _mute_command(event.text)
+        if cmd:
+            scope = "thread" if thread_ts else "channel"
+            if cmd == "mute":
+                if thread_ts:
+                    store.mute_thread(channel, thread_ts)
+                else:
+                    store.mute_channel(channel)
+            else:
+                if thread_ts:
+                    store.unmute_thread(channel, thread_ts)
+                else:
+                    store.unmute_channel(channel)
+            verb = "muted" if cmd == "mute" else "unmuted"
+            return (
+                Decision.RECORD_REWRITE,
+                f"[ambient-watch] Ambient nudges are now {verb} for this {scope}. "
+                f"Confirm this to the user in one short sentence and take no other action.",
+            )
+
         if mention:
             return Decision.RECORD_PASS
         if thread_ts and store.is_engaged(channel, thread_ts):

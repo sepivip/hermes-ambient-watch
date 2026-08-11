@@ -73,6 +73,8 @@ def find_candidates(store, cfg, now: float) -> list[Candidate]:
 
     out: list[Candidate] = []
     for channel in sorted(cfg.channels):
+        if store.is_channel_muted(channel):
+            continue  # someone muted the whole channel from Slack
         if store.channel_self_quieted(channel, cfg.self_quiet_after_ignored):
             continue
         last = store.last_intervention_at(channel)

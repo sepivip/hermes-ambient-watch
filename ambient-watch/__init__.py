@@ -148,6 +148,10 @@ def register(ctx):
         if event is None:
             return None
         verdict = decide(event, cfg, store)
+        if isinstance(verdict, tuple):
+            # (RECORD_REWRITE, replacement_text) — an in-channel control
+            # command; replace the text so the agent confirms it to the human.
+            return {"action": "rewrite", "text": verdict[1]}
         if verdict is Decision.RECORD_SKIP:
             return {"action": "skip", "reason": "ambient-watch: recorded"}
         return None
