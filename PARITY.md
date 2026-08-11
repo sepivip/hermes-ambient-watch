@@ -27,18 +27,35 @@ we nudge, Claude Tag answers.**
 
 ## Gaps, in priority order
 
-### P0 — behavioural, this is what "not the same" means
+### CLOSED 2026-08-11 — model judgment
 
-1. **Ambient replies to ordinary messages.** Claude Tag: *"Claude replies … to channel
-   messages it judges warrant a reply … Sometimes, when it can answer a question or
-   pick up a task."* Ours only ever considers a thread that has gone **quiet**. A fresh
-   question in a watched channel is recorded and ignored until it ages past
-   `min_age_minutes`. Different product.
-2. **It answers; we nudge.** Claude Tag resolves the question. Our best output is
-   "surfacing this — no reply for 3 hours". A nudge is the fallback Claude Tag uses
-   when it *can't* help, not its main behaviour.
+*"It answers; we nudge"* is closed. `aw_judge` replaced the `?` regex with one bounded
+auxiliary-LLM call per sweep. First real verdict, on "Anyone can tell me the population
+of Georgia?":
+
+    post  conf=0.96
+    why:   Clarification is needed before answering the population question accurately
+    nudge: Do you mean the country of Georgia or the U.S. state?
+
+It spotted the ambiguity rather than answering wrongly — no regex or template reaches
+that. Cost $0.0045. Fail-closed with **no fallback wording**: any exception, timeout,
+non-JSON reply, schema violation or unsafe text yields silence, never a canned line.
+Cooldowns and per-day caps are deleted, as Claude Tag has neither; the spend limit and
+the `last_activity_seen` re-judge watermark replace them.
+
+### P0 — still not the same
+
+1. **Latency: we wait, Claude Tag doesn't.** Claude Tag replies *"to channel messages it
+   judges warrant a reply"* as they arrive. Our judge only ever sees a thread that has
+   already gone quiet for `min_age_minutes`. The judgment is now equivalent; the *trigger*
+   is not. Closing this means judging on message arrival (debounced, budget-gated) rather
+   than on a 15-minute sweep.
+2. **Capability breadth.** A Claude Tag session *"reads documents, runs code, builds
+   charts, and opens pull requests"* in a sandbox. Our ambient path is one LLM call that
+   emits one line of text — it cannot act. (Hermes' **mention** path has the full toolset
+   and is arguably more capable, but that is Hermes, not our ambient loop.)
 3. **Per-channel "Respond automatically" toggle**, changeable from the channel itself.
-   We have a global `channels` allowlist and no in-channel control except mute.
+   We have a global `channels` allowlist plus `hermes ambient mute`.
 
 ### P1 — context fidelity
 
