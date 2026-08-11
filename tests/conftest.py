@@ -6,6 +6,12 @@ Fakes mirror the contracts verified against hermes-agent v0.20.0
 - MessageEvent: text, message_type, message_id (= Slack ts), user_id,
   source (platform, user_id, chat_id, user_name, chat_type), raw_message
   (raw Slack event dict, may contain Block Kit "blocks"), metadata.
+- chat_type is ONLY ever "dm" or "group" — the Slack adapter builds it as
+  ``"dm" if is_dm else "group"`` (plugins/platforms/slack/adapter.py:6227,
+  where is_dm covers both 1:1 IMs and MPIM group DMs), so it never emits
+  "channel". make_event() therefore defaults to "group": a fake that said
+  "channel" would let recorder logic keyed on that value pass the whole
+  suite and suppress nothing in production.
 - Slash commands produce a second shape: chat_type="group", no metadata,
   raw_message = slash payload with "command" key and NO "ts".
 - send_message tool targets are "slack:C…:<thread_ts>" — PLATFORM PREFIX
@@ -74,7 +80,7 @@ def make_event(
     thread_ts=None,
     user="U0HUMAN001",
     platform="slack",
-    chat_type="channel",
+    chat_type="group",
     bot_id=None,
     subtype=None,
     blocks=None,
