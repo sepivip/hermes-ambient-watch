@@ -13,6 +13,7 @@ state.db). Timestamps are Slack ts strings or bare epoch floats.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -132,6 +133,24 @@ class AmbientStore:
                 (channel,),
             )
             return [dict(r) for r in cur.fetchall()]
+
+    def thread_root(self, channel, ts):
+        """One thread's ROOT row, or None — the narrow form of thread_roots().
+
+        Exists for the arrival path. ``thread_roots`` returns every root in the
+        channel WITH its text, and the arrival ladder considers exactly one
+        thread, so filtering that scan in Python would make each arrival
+        attempt O(roots in the channel) while holding this connection's RLock —
+        the same RLock the recorder needs on the gateway loop thread. This hits
+        the (channel, ts) primary key instead.
+        """
+        with self._lock:
+            cur = self._db.execute(
+                "SELECT * FROM messages WHERE channel=? AND ts=? AND ts=thread_root",
+                (channel, ts),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
 
     def thread_messages(self, channel, root):
         with self._lock:
@@ -393,16 +412,121 @@ class AmbientStore:
             ).rowcount
             return removed
 
-    # -- kill switch ------------------------------------------------------
-    def set_kill_switch(self, on: bool):
+    # -- flags (generic key/value; the kill switch is one of them) --------
+    def set_flag(self, key: str, value):
         with self._lock, self._db:
             self._db.execute(
-                "INSERT OR REPLACE INTO flags (key, value) VALUES ('kill_switch', ?)",
-                ("1" if on else "0",),
+                "INSERT OR REPLACE INTO flags (key, value) VALUES (?,?)",
+                (str(key), str(value)),
             )
 
-    def kill_switch(self) -> bool:
+    def get_flag(self, key: str, default=None):
         with self._lock:
+            cur = self._db.execute(
+                "SELECT value FROM flags WHERE key=?", (str(key),)
+            )
+            row = cur.fetchone()
+            return row["value"] if row else default
+
+    # -- kill switch ------------------------------------------------------
+    def set_kill_switch(self, on: bool):
+        self.set_flag("kill_switch", "1" if on else "0")
+
+    def kill_switch(self) -> bool:
+        return self.get_flag("kill_switch", "0") == "1"
+
+    #: Returned by ``kill_switch_nowait`` when the connection lock was busy.
+    LOCK_BUSY = object()
+
+    def kill_switch_nowait(self, default=LOCK_BUSY):
+        """Read the kill switch WITHOUT ever waiting for the connection lock.
+
+        This exists for exactly one caller: the arrival path's Tier A, which
+        runs on the GATEWAY EVENT LOOP THREAD inside ``pre_gateway_dispatch``.
+        Blocking there is not acceptable — a worker thread (an
+        ``asyncio.to_thread`` DB write from the pump, or a tool-executor call)
+        can hold this RLock for up to ``busy_timeout=5000`` ms while contending
+        with the sweep process, which would stall dispatch for every message on
+        every platform for five seconds.
+
+        Returns ``default`` (``LOCK_BUSY`` by default) rather than waiting, so
+        the caller keeps whatever answer it already had. That is safe because
+        Tier A is only an optimisation: the pump re-reads the switch FRESH,
+        off-thread, immediately before anything can be spent.
+        """
+        if not self._lock.acquire(blocking=False):
+            return default
+        try:
             cur = self._db.execute("SELECT value FROM flags WHERE key='kill_switch'")
             row = cur.fetchone()
             return bool(row) and row["value"] == "1"
+        finally:
+            self._lock.release()
+
+    # -- arrival-mode counters --------------------------------------------
+    # Judgments happen in the long-lived GATEWAY process; reporting happens on
+    # the sweep's tick, in a different process. So arrival activity needs a
+    # durable counter rather than an in-memory one — and it has to be a
+    # counter, not a scan of `judgments`, because no row records WHICH trigger
+    # produced it and a scan would re-report the sweep's own work as arrival
+    # activity.
+    #
+    # Numbers only, by construction: this is the ops surface, so it must be
+    # structurally incapable of carrying channel text.
+    _ARRIVAL_COUNTER_KEY = "arrival_counters"
+    _ARRIVAL_REPORTED_KEY = "arrival_reported"
+    ARRIVAL_COUNTERS = (
+        "judged", "posted", "withheld", "declined", "throttled", "shadow",
+        "errors", "post_failed",
+    )
+
+    def _json_flag(self, key: str) -> dict:
+        raw = self.get_flag(key, "")
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def arrival_counters(self) -> dict:
+        return self._json_flag(self._ARRIVAL_COUNTER_KEY)
+
+    def arrival_reported(self) -> dict:
+        return self._json_flag(self._ARRIVAL_REPORTED_KEY)
+
+    def set_arrival_reported(self, counters: dict):
+        self.set_flag(self._ARRIVAL_REPORTED_KEY, json.dumps(dict(counters or {})))
+
+    def bump_arrival_counters(self, now=None, **deltas) -> dict:
+        """Read-modify-write the arrival counters. Never raises.
+
+        Cross-process this RMW can lose an increment if the sweep writes the
+        same key in the same instant. The blast radius is one ops line being
+        off by one, which is why it is not worth a cross-process lock on the
+        gateway's event loop.
+        """
+        with self._lock, self._db:
+            cur = self._db.execute(
+                "SELECT value FROM flags WHERE key=?", (self._ARRIVAL_COUNTER_KEY,)
+            )
+            row = cur.fetchone()
+            data = {}
+            if row:
+                try:
+                    parsed = json.loads(row["value"])
+                    data = parsed if isinstance(parsed, dict) else {}
+                except ValueError:
+                    data = {}
+            for key, delta in deltas.items():
+                try:
+                    data[key] = (data.get(key) or 0) + delta
+                except TypeError:
+                    data[key] = delta
+            data["updated_at"] = time.time() if now is None else float(now)
+            self._db.execute(
+                "INSERT OR REPLACE INTO flags (key, value) VALUES (?,?)",
+                (self._ARRIVAL_COUNTER_KEY, json.dumps(data)),
+            )
+            return dict(data)

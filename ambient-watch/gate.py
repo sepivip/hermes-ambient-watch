@@ -213,6 +213,58 @@ def install_gate(hermes_home=None) -> Path:
     return shim
 
 
+def report_arrival_activity(store, cfg, now: float | None = None) -> list:
+    """Announce what the ARRIVAL trigger did since the last report.
+
+    Arrival-time judging happens in the long-lived gateway process, which has
+    no ``--deliver`` target and must not open a second outbound path from the
+    gateway to Slack (that would be a new place to leak). So the sweep reports
+    it, from durable counters in the ``flags`` table.
+
+    Counters rather than a scan of ``judgments``: no ledger row records WHICH
+    trigger produced it, so a scan would re-report the sweep's own work as
+    arrival activity. And the line is numbers only, by construction — this
+    reaches the ops channel and cron persists it under
+    ``cron/output/<job_id>/``, which the L3 jail does not cover.
+
+    Best effort: never raises, and a quiet window returns [] so the tick stays
+    silent.
+    """
+    try:
+        counters = store.arrival_counters()
+        if not counters:
+            return []
+        reported = store.arrival_reported()
+        keys = getattr(store, "ARRIVAL_COUNTERS", (
+            "judged", "posted", "withheld", "declined", "throttled", "shadow",
+            "errors", "post_failed",
+        ))
+
+        def _num(source, key):
+            try:
+                return float(source.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        delta = {k: int(_num(counters, k) - _num(reported, k)) for k in keys}
+        if not any(v > 0 for v in delta.values()):
+            return []
+        usd = _num(counters, "usd") - _num(reported, "usd")
+        store.set_arrival_reported(counters)
+        body = " ".join(f"{k}={delta[k]}" for k in keys if delta[k])
+        return [
+            f"ambient-watch: ARRIVAL since last report -- {body} "
+            f"spend=${max(usd, 0.0):.4f} (judged in the gateway process; "
+            f"pending threads and rate buckets are in-memory there)"
+        ]
+    except Exception as exc:  # noqa: BLE001 — reporting is never load-bearing
+        record_gate_error(
+            f"arrival activity report failed ({type(exc).__name__}): {exc}",
+            data_dir=getattr(cfg, "data_dir", None),
+        )
+        return []
+
+
 def _split_usage(total: int, parts: int) -> list:
     """Attribute one batched call's tokens across the channels it judged."""
     if parts <= 0:
@@ -246,13 +298,36 @@ def run_gate(cfg, store, now: float | None = None, judge_fn=None, transport=None
             import aw_judge
             import aw_post
 
+        budget = aw_budget.Budget(store, cfg.budget_cfg())
+
+        # ---- reporting surface for BOTH triggers ----------------------
+        # This block sits ABOVE the no-candidates early return on purpose.
+        # Arrival-time judging runs in the GATEWAY process, which has no
+        # `--deliver` and must not open a second outbound path to Slack, so the
+        # sweep is the only place its activity and its budget alerts can be
+        # announced. Before this move, a tick with no SWEEP candidates returned
+        # before `Budget` was even constructed — so a 75%/95% threshold crossed
+        # by an arrival-time call would never be announced and arrival activity
+        # would never reach the ops channel at all.
+        arrival_lines = report_arrival_activity(store, cfg, now)
+        if arrival_lines:
+            lines.extend(arrival_lines)
+            reportable = True
+        for channel in sorted(cfg.channels):
+            fired = budget.take_pending_alert(channel, now=now)
+            if fired is not None:
+                reportable = True
+                lines.append(
+                    f"ambient-watch: BUDGET ALERT -- {channel} crossed "
+                    f"{fired:.0%} of a spend cap"
+                )
+
         nominees = aw_detectors.find_candidates(store, cfg, now)
         if not nominees:
             lines.append("ambient-watch: no candidates")
-            lines.append(WAKE_FALSE)
+            if not reportable:
+                lines.append(WAKE_FALSE)
             return "\n".join(lines)
-
-        budget = aw_budget.Budget(store, cfg.budget_cfg())
 
         # ---- spend gate BEFORE any judgment ---------------------------
         # Claude Tag declines work over cap rather than truncating it, and a

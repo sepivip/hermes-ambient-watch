@@ -22,6 +22,7 @@ import re
 import shutil
 from pathlib import Path
 
+from .aw_arrival import ArrivalRuntime
 from .aw_config import hermes_home, load_config
 from .aw_guard import check_tool_call, data_dir_jail, looks_sensitive
 from .aw_judge import AUX_TASK
@@ -183,6 +184,30 @@ def register(ctx):
         )
     _warn_auth_posture()
 
+    # ARRIVAL-TIME JUDGING — ships dark. With arrival_enabled false no runtime
+    # object exists, so no pump task is ever created and the plugin's
+    # observable behaviour is byte-identical to the sweep-only build. That is
+    # the rollback: one boolean, and nothing but the gateway to restart.
+    arrival = None
+    if getattr(cfg, "arrival_enabled", False):
+        try:
+            arrival = ArrivalRuntime(cfg, store)
+            logger.info(
+                "ambient-watch: arrival-time judging ENABLED "
+                "(debounce=%ss, max_wait=%ss, %s/hour per channel, %s/hour global, "
+                "burst=%s) — the sweep remains the stalled-thread trigger and the "
+                "reporting surface",
+                cfg.arrival_debounce_seconds, cfg.arrival_max_wait_seconds,
+                cfg.arrival_judgments_per_channel_hour,
+                cfg.arrival_judgments_global_hour, cfg.arrival_burst,
+            )
+        except Exception:  # noqa: BLE001 — degrade to sweep-only, never break
+            logger.exception(
+                "ambient-watch: arrival-time judging could not start; "
+                "continuing sweep-only"
+            )
+            arrival = None
+
     def on_pre_gateway_dispatch(event=None, **kwargs):
         if event is None:
             return None
@@ -192,6 +217,12 @@ def register(ctx):
             # command; replace the text so the agent confirms it to the human.
             return {"action": "rewrite", "text": verdict[1]}
         if verdict is Decision.RECORD_SKIP:
+            if arrival is not None:
+                # Tier A, on the loop thread: pure-memory enqueue plus a lazy
+                # pump. Its own try/except lives inside note(), so an
+                # arrival-path bug can never change the recorder's verdict or
+                # raise into _handle_message.
+                arrival.note(event)
             return {"action": "skip", "reason": "ambient-watch: recorded"}
         return None
 

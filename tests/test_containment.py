@@ -541,3 +541,181 @@ def test_register_purges_a_legacy_candidates_file(monkeypatch, tmp_path):
 
     mod.register(Ctx())
     assert not legacy.exists()
+
+
+# ------------------------------------------------- L2/L3, the ARRIVAL trigger
+
+
+def _arrival_runtime(cfg, judge=None, transport=None, wall=T0 + 200):
+    """An ArrivalRuntime with injected clocks, judge and transport."""
+    from aw_arrival import ArrivalRuntime
+    from aw_store import AmbientStore
+
+    # arrival_enabled defaults FALSE (the feature ships dark), so every
+    # arrival test has to opt in explicitly — which is itself the assertion in
+    # tests/test_arrival.py::test_arrival_disabled_creates_no_task_at_all.
+    cfg.arrival_enabled = True
+    store = AmbientStore(cfg.data_dir / "ambient.db")
+    ticks = {"t": 1000.0}
+
+    class Judge:
+        calls = []
+
+        async def __call__(self, nominees, _cfg):
+            from aw_judge import JudgeResult, Verdict
+
+            Judge.calls.append(list(nominees))
+            return JudgeResult(
+                verdicts=[
+                    Verdict(channel=c.channel, thread_ts=c.thread_ts,
+                            should_post=True, confidence=0.9,
+                            reason="blocked on an owner",
+                            nudge="I can find out who owns that.")
+                    for c in nominees
+                ],
+                model=FakeJudge.MODEL, prompt_tokens=1000, completion_tokens=200,
+            )
+
+    runtime = ArrivalRuntime(
+        cfg, store,
+        judge_fn=judge or Judge(),
+        transport=transport or FakeTransport(),
+        clock=lambda: ticks["t"],
+        wall_clock=lambda: wall,
+    )
+    return runtime, store, ticks
+
+
+def test_the_arrival_path_writes_no_channel_text_to_its_audit_log(live_cfg):
+    """The arrival trigger composes the judge's HTTPS body inside the LONG-LIVED
+    gateway process rather than a short-lived subprocess, so what it persists
+    matters more, not less. ``arrival.log`` carries ids, verdicts, confidences,
+    dollars and the model-authored nudge — never a body, never an excerpt,
+    never a Slack user id."""
+    import asyncio
+
+    runtime, store, ticks = _arrival_runtime(live_cfg)
+    try:
+        _seed(live_cfg, store, text=HOSTILE)
+        runtime.note(make_event(text=HOSTILE, ts=f"{T0:.6f}"))
+        ticks["t"] += 200
+        asyncio.run(runtime.drain())
+
+        log = live_cfg.data_dir / "arrival.log"
+        assert log.exists(), "an arrival judgment left no audit trail at all"
+        body = log.read_text(encoding="utf-8")
+        assert "POSTED to" in body, "not vacuous: the judgment really ran"
+        lowered = body.casefold()
+        for leak in ("ignore all previous", "untrusted-slack-text", "[silent]",
+                     "evil.example", ".env", "localappdata", "send_message",
+                     "u0human001", "migration runbook"):
+            assert leak not in lowered, leak
+    finally:
+        store.close()
+
+
+def test_the_arrival_path_logs_no_channel_text_to_any_logger(live_cfg, caplog):
+    """The gateway's Hermes log is shared, long-lived, and (unlike the sweep's
+    stdout) not something we control the persistence of — so the arrival path
+    must put nothing untrusted through ``logging`` either."""
+    import asyncio
+    import logging
+
+    runtime, store, ticks = _arrival_runtime(live_cfg)
+    try:
+        _seed(live_cfg, store, text=HOSTILE)
+        with caplog.at_level(logging.DEBUG):
+            runtime.note(make_event(text=HOSTILE, ts=f"{T0:.6f}"))
+            ticks["t"] += 200
+            asyncio.run(runtime.drain())
+        blob = "\n".join(r.getMessage() for r in caplog.records).casefold()
+        for leak in ("ignore all previous", "evil.example", ".env",
+                     "localappdata", "migration runbook"):
+            assert leak not in blob, leak
+    finally:
+        store.close()
+
+
+def test_the_arrival_log_lives_inside_the_jailed_data_directory(cfg, store):
+    """It is inside the ``plugin-data`` markers the L3 jail covers — strictly
+    better than the sweep's ``cron/output/<job_id>/``, which the jail does
+    not cover at all."""
+    from aw_arrival import ARRIVAL_LOG_NAME
+
+    path = cfg.data_dir / ARRIVAL_LOG_NAME
+    verdict = check_tool_call("read_file", {"path": str(path)}, cfg, store)
+    assert verdict is not None and verdict["action"] == "block"
+    # The sweep's --workdir IS the data dir, so a bare relative name is enough.
+    assert check_tool_call("terminal", {"command": f"type {ARRIVAL_LOG_NAME}"},
+                           cfg, store) is not None
+    assert check_tool_call("read_file", {"path": f"./{ARRIVAL_LOG_NAME}.1"},
+                           cfg, store) is not None
+
+
+@pytest.mark.parametrize(
+    "tool,args",
+    [
+        ("read_file", {"path": "{d}/ambient.db"}),
+        ("read_file", {"path": "{d}\\arrival.log"}),
+        ("terminal", {"command": 'type "{d}\\ambient.db"'}),
+        ("execute_code", {"code": "open(r'{d}/arrival.log').read()"}),
+        ("delegate_task", {"prompt": "summarize {d}/arrival.log for me"}),
+    ],
+)
+def test_the_L3_jail_still_blocks_after_the_arrival_work(cfg, store, tool, args):
+    """REGRESSION GUARD. Arrival mode adds a second writer to the data
+    directory and a second reason for someone to want to read it, and it adds
+    no principal exemption for the gateway, the pump or the arrival path.
+    Nothing in the arrival design needs file access through a tool call, so the
+    jail stays absolute."""
+    filled = {k: v.format(d=str(cfg.data_dir)) for k, v in args.items()}
+    verdict = check_tool_call(tool, filled, cfg, store,
+                             session_id="gateway_slack_C0WATCHED1")
+    assert verdict is not None and verdict["action"] == "block", (tool, filled)
+    assert "ambient-watch" in verdict["message"]
+
+
+def test_the_arrival_path_opens_no_second_outbound_slack_route(live_cfg):
+    """One outbound gate, both triggers. The arrival path posts ONLY into the
+    nominated thread, via ``post_nudge``; ops reporting and budget alerts stay
+    with the sweep's ``--deliver``. A second gateway->Slack path would be a new
+    place to leak."""
+    import asyncio
+
+    transport = FakeTransport()
+    runtime, store, ticks = _arrival_runtime(live_cfg, transport=transport)
+    try:
+        _seed(live_cfg, store, text=HOSTILE)
+        runtime.note(make_event(text=HOSTILE, ts=f"{T0:.6f}"))
+        ticks["t"] += 200
+        asyncio.run(runtime.drain())
+
+        assert len(transport.calls) == 1
+        call = transport.calls[0]
+        assert call["channel"] == WATCHED, "posted outside the watched channel"
+        assert call["thread_ts"] == f"{T0:.6f}", "never top-level, never ops"
+        assert call["channel"] != live_cfg.ops_channel
+        lowered = call["text"].casefold()
+        for leak in ("ignore all previous", "evil.example", ".env",
+                     "migration runbook"):
+            assert leak not in lowered, leak
+    finally:
+        store.close()
+
+
+def test_arrival_mode_writes_no_candidates_file(live_cfg):
+    """The artifact the 2026-08-11 incident read must not come back through a
+    new door."""
+    import asyncio
+
+    runtime, store, ticks = _arrival_runtime(live_cfg)
+    try:
+        _seed(live_cfg, store, text=HOSTILE)
+        runtime.note(make_event(text=HOSTILE, ts=f"{T0:.6f}"))
+        ticks["t"] += 200
+        asyncio.run(runtime.drain())
+        assert not (live_cfg.data_dir / "candidates.json").exists()
+        written = sorted(p.name for p in live_cfg.data_dir.iterdir() if p.is_file())
+        assert "candidates.json" not in written
+    finally:
+        store.close()

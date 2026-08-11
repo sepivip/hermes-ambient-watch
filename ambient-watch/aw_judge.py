@@ -326,30 +326,75 @@ def hermes_llm(messages, cfg):
     )
 
 
-def judge(nominees, cfg, llm=None) -> JudgeResult:
-    """One batched judgment call for this sweep's nominees.
+async def hermes_allm(messages, cfg):
+    """Async transport: the SAME auxiliary client, one layer down.
 
-    Batched rather than per-candidate because the system rules dominate the
-    prompt: N nominees in one call cost far less than N calls, and there is at
-    most one nominee per channel per sweep anyway.
+    ``ctx.llm.acomplete_structured`` looks like the natural in-gateway seam and
+    is the wrong one: ``PluginLlm._invoke_async`` calls
+    ``async_call_llm(task=None, ...)`` (agent/plugin_llm.py:989-1002), so
+    ``_resolve_task_provider_model`` never reads ``auxiliary.ambient_watch_judge``
+    and judgment silently moves off the operator's pinned cheap model onto the
+    user's MAIN chat model — with provider/model overrides fail-closed behind
+    ``plugins.entries.ambient-watch.llm.allow_*_override``. Calling
+    ``async_call_llm(task=AUX_TASK, ...)`` directly keeps the task resolution,
+    the ``auxiliary.<key>`` knob and a per-task/per-loop async semaphore
+    (agent/auxiliary_client.py:7977-7994, :9705-9743), and it is genuinely
+    non-blocking (AsyncOpenAI clients; the Anthropic/Codex/Bedrock adapters
+    offload via ``asyncio.to_thread``).
+
+    ``load_hermes_dotenv`` is not needed in the gateway (keys are already
+    loaded) but stays because it is idempotent and makes this callable from a
+    bare script.
     """
-    nominees = list(nominees or [])
-    if not nominees:
-        return JudgeResult()
-    call = llm or hermes_llm
     try:
-        response = call(build_messages(nominees), cfg)
-    except Exception as exc:  # noqa: BLE001 — never post because of a failure
-        # The prompt was (probably) sent and (probably) billed; we just never
-        # learned the count. Charge the estimate rather than nothing — see
-        # estimate_prompt_tokens for why zero is the unbounded option.
-        return JudgeResult(
-            model=str(getattr(cfg, "judge_model", "") or ""),
-            prompt_tokens=estimate_prompt_tokens(nominees),
-            estimated=True,
-            error=f"{type(exc).__name__}: {exc}",
-        )
+        from hermes_cli.env_loader import load_hermes_dotenv
 
+        try:
+            from .aw_config import hermes_home
+        except ImportError:
+            from aw_config import hermes_home
+
+        load_hermes_dotenv(hermes_home=str(hermes_home()))
+    except Exception:  # noqa: BLE001 — keys may already be present
+        pass
+
+    from agent.auxiliary_client import async_call_llm
+
+    kwargs = {}
+    if getattr(cfg, "judge_model", ""):
+        kwargs["model"] = cfg.judge_model
+    if getattr(cfg, "judge_provider", ""):
+        kwargs["provider"] = cfg.judge_provider
+    return await async_call_llm(
+        task=AUX_TASK,
+        messages=messages,
+        temperature=0.0,
+        max_tokens=int(cfg.judge_max_tokens),
+        timeout=float(cfg.judge_timeout_seconds),
+        **kwargs,
+    )
+
+
+def result_from_failure(exc, nominees, cfg) -> JudgeResult:
+    """A call that raised. The prompt was (probably) sent and (probably)
+    billed; we just never learned the count. Charge the estimate rather than
+    nothing — see estimate_prompt_tokens for why zero is the unbounded
+    option."""
+    return JudgeResult(
+        model=str(getattr(cfg, "judge_model", "") or ""),
+        prompt_tokens=estimate_prompt_tokens(nominees),
+        estimated=True,
+        error=f"{type(exc).__name__}: {exc}",
+    )
+
+
+def _result_from_response(response, nominees) -> JudgeResult:
+    """Validate and meter a provider reply.
+
+    Shared verbatim by the sync ``judge`` and the async ``ajudge`` so the
+    prompt, the validation and the outbound sanitizer have exactly ONE
+    implementation — a second copy is how one trigger quietly loses a control.
+    """
     model, prompt_tokens, completion_tokens = response_usage(response)
     result = JudgeResult(
         model=model,
@@ -371,3 +416,47 @@ def judge(nominees, cfg, llm=None) -> JudgeResult:
         result.prompt_tokens = estimate_prompt_tokens(nominees)
         result.estimated = bool(result.prompt_tokens)
     return result
+
+
+def judge(nominees, cfg, llm=None) -> JudgeResult:
+    """One batched judgment call for this sweep's nominees.
+
+    Batched rather than per-candidate because the system rules dominate the
+    prompt: N nominees in one call cost far less than N calls, and there is at
+    most one nominee per channel per sweep anyway.
+    """
+    nominees = list(nominees or [])
+    if not nominees:
+        return JudgeResult()
+    call = llm or hermes_llm
+    try:
+        response = call(build_messages(nominees), cfg)
+    except Exception as exc:  # noqa: BLE001 — never post because of a failure
+        return result_from_failure(exc, nominees, cfg)
+    return _result_from_response(response, nominees)
+
+
+async def ajudge(nominees, cfg, allm=None) -> JudgeResult:
+    """The arrival path's judgment: same prompt, same validation, one await.
+
+    The only differences from ``judge`` are the transport and the cancellation
+    rule. ``asyncio.CancelledError`` is handled SEPARATELY from ``Exception``
+    (it is a BaseException since 3.8, so it would escape anyway — the explicit
+    re-raise is documentation): a cancelled call means the gateway is shutting
+    down, and a shutdown is not a provider outage. No post, no breadcrumb, and
+    crucially no estimate charge — charging for a call we ourselves aborted
+    would let every restart nibble at the day's cap.
+    """
+    import asyncio
+
+    nominees = list(nominees or [])
+    if not nominees:
+        return JudgeResult()
+    call = allm or hermes_allm
+    try:
+        response = await call(build_messages(nominees), cfg)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — never post because of a failure
+        return result_from_failure(exc, nominees, cfg)
+    return _result_from_response(response, nominees)

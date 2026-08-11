@@ -81,23 +81,83 @@ def _in_quiet_hours(cfg, now: float) -> bool:
     return lm >= start or lm < end  # window wraps midnight
 
 
-def find_candidates(store, cfg, now: float) -> list[Candidate]:
-    """Nominate threads for judgment. Cheap, deterministic, zero tokens."""
+def _roots(store, channel: str, only_root):
+    """The root rows this call has to consider.
+
+    ``only=`` narrows the ladder to ONE thread, and it has to narrow in SQL.
+    Filtering a full ``thread_roots`` scan in Python would make every arrival
+    attempt O(roots in the channel) — ``SELECT *``, message text included —
+    while holding the ledger's single-connection RLock, which the recorder needs
+    on the GATEWAY LOOP THREAD for ``record_message``.
+
+    That cost would be unmetered, which is what makes it a denial-of-service
+    rather than an inefficiency: an ineligible thread is refused at a rung BELOW
+    this one and therefore never reaches ``TokenBuckets.take``, so a bot-rooted
+    thread, an already-shadow-seen thread, or a thread a chatty webhook keeps
+    fresh can be re-walked for free on every human message, forever.
+    """
+    if only_root is None:
+        return store.thread_roots(channel)
+    lookup = getattr(store, "thread_root", None)
+    if lookup is None:  # a store without the narrow query: correct, just slower
+        return [r for r in store.thread_roots(channel) if r["ts"] == only_root]
+    row = lookup(channel, only_root)
+    return [row] if row else []
+
+
+def find_candidates(
+    store, cfg, now: float, *, only=None, min_age_seconds=None, limit=None
+) -> list[Candidate]:
+    """Nominate threads for judgment. Cheap, deterministic, zero tokens.
+
+    ONE LADDER, TWO TRIGGERS. The sweep calls this with no keywords and gets
+    byte-identical behaviour to the sweep-only build. The arrival path calls
+    the SAME function for a single thread with a shorter age window:
+
+        find_candidates(store, cfg, now, only=(channel, root),
+                        min_age_seconds=cfg.arrival_debounce_seconds, limit=1)
+
+    That is deliberate and it is the most important structural decision in the
+    arrival design. A second eligibility ladder would drift, and the one that
+    drifts is the one that spends money and posts. Every control below —
+    quiet hours at fire time, channel mute, ``channel_self_quieted``, thread
+    mute, root ``is_bot``, ``is_engaged``, ``has_intervention``,
+    ``is_shadow_seen``, the age window and the ``needs_judgment`` re-judge
+    watermark — is therefore inherited whole by both triggers.
+
+    ``only=(channel, root)`` restricts the scan to one thread; ``min_age_seconds``
+    overrides ``cfg.min_age_minutes * 60``; ``limit`` overrides
+    ``cfg.candidates_per_run``.
+    """
     if _in_quiet_hours(cfg, now):
         return []
 
     shadow = cfg.mode != "live"
     out: list[Candidate] = []
 
-    for channel in sorted(cfg.channels):
+    age_floor = (
+        cfg.min_age_minutes * 60 if min_age_seconds is None else float(min_age_seconds)
+    )
+    cap = cfg.candidates_per_run if limit is None else int(limit)
+    channels = sorted(cfg.channels)
+    only_root = None
+    if only is not None:
+        only_channel, only_root = only
+        if only_channel not in cfg.channels:
+            return []
+        channels = [only_channel]
+
+    for channel in channels:
         if store.is_channel_muted(channel):
             continue  # someone muted the whole channel from Slack
         if store.channel_self_quieted(channel, cfg.self_quiet_after_ignored):
             continue
 
         best: Candidate | None = None
-        for root in store.thread_roots(channel):
+        for root in _roots(store, channel, only_root):
             root_ts = root["ts"]
+            if only_root is not None and root_ts != only_root:
+                continue
             if root["is_bot"]:
                 continue
             if store.is_muted(channel, root_ts):
@@ -113,7 +173,7 @@ def find_candidates(store, cfg, now: float) -> list[Candidate]:
             if not msgs:
                 continue
             last_activity = max(float(m["ts"]) for m in msgs)
-            if (now - last_activity) < cfg.min_age_minutes * 60:
+            if (now - last_activity) < age_floor:
                 continue  # still moving — leave it alone
             if not store.needs_judgment(
                 channel, root_ts, last_activity, cfg.judge_max_rejudge
@@ -152,4 +212,4 @@ def find_candidates(store, cfg, now: float) -> list[Candidate]:
             out.append(best)
 
     out.sort(key=lambda c: (-c.human_participants, -c.last_activity))
-    return out[: cfg.candidates_per_run]
+    return out[:cap]

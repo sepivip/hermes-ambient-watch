@@ -88,6 +88,60 @@ def _is_bot(event, bot_user_id: str) -> bool:
     )
 
 
+def arrival_key(event, cfg):
+    """Tier A of the arrival path: ``(channel, thread_root, last_activity)``.
+
+    Pure — no ledger, no clock, no I/O, no allocation beyond a tuple — because
+    it runs inside ``pre_gateway_dispatch``, which Hermes invokes
+    SYNCHRONOUSLY from ``async def _handle_message`` (``plugins.py``:
+    ``ret = cb(**kwargs)``). Anything slow here delays every inbound message
+    on every platform.
+
+    Returns ``None`` for anything the arrival path must not enqueue.
+
+    THE BOT RUNG IS LOAD-BEARING AND NOT REDUNDANT. ``decide()`` returns
+    ``RECORD_SKIP`` for bot-authored messages too (see below), so enqueueing on
+    ``RECORD_SKIP`` alone would let our OWN posted nudge re-trigger judgment on
+    the thread it just landed in. ``has_intervention`` would stop the second
+    post, so the symptom would be silent wasted spend rather than a visible
+    loop — the worst shape of bug for this project. Hence an explicit rung
+    here, and ``decide()``'s contract left byte-identical.
+    """
+    try:
+        source = getattr(event, "source", None)
+        platform = getattr(getattr(source, "platform", None), "value", None) or getattr(
+            source, "platform", None
+        )
+        if str(platform) != "slack":
+            return None
+        if getattr(source, "chat_type", "") == "dm":
+            return None
+        if _is_slash_command(event):
+            return None
+        channel = _channel_of(event)
+        if not channel or channel not in cfg.channels:
+            return None
+        if _is_bot(event, cfg.bot_user_id):
+            return None
+        if _is_mention(event, cfg.bot_user_id):
+            return None
+        if _mute_command(getattr(event, "text", "")):
+            return None  # an in-channel control message, not a thread to judge
+        raw = getattr(event, "raw_message", None)
+        raw = raw if isinstance(raw, dict) else {}
+        ts = getattr(event, "message_id", None) or raw.get("ts")
+        if not ts:
+            return None
+        root = raw.get("thread_ts") or ts
+        try:
+            last_activity = float(ts)
+        except (TypeError, ValueError):
+            return None
+        return str(channel), str(root), last_activity
+    except Exception:  # noqa: BLE001 — never raise into the gateway loop
+        return None
+
+
 def decide(event, cfg, store) -> Decision:
     source = getattr(event, "source", None)
     platform = getattr(getattr(source, "platform", None), "value", None) or getattr(

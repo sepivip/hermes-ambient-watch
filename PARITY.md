@@ -5,9 +5,11 @@ Measured against Anthropic's own spec, not against our design doc:
 - https://claude.com/docs/claude-tag/users/when-claude-responds
 - https://claude.com/docs/claude-tag/users/proactivity
 
-Verified 2026-08-11 against hermes-agent v0.20.0 source and the live install.
-**Verdict: the session/threading model matches. The behaviour does not yet —
-we nudge, Claude Tag answers.**
+Verified 2026-08-11 against hermes-agent v0.20.0 source and the live install; arrival-time
+judging re-verified 2026-08-12.
+**Verdict: the session/threading model matches, and the trigger now matches too. The
+behaviour still does not — we nudge, Claude Tag answers, and closing *that* gap is
+deliberately blocked on human consent (gap 2 below).**
 
 ## Matches
 
@@ -18,6 +20,7 @@ we nudge, Claude Tag answers.**
 | "Two threads in the same channel are two separate sessions" | `thread_id` participates in the session key | `build_session_key` |
 | "The thread is durable; the sandbox is not" | Hermes sessions persist in sqlite; no sandbox to lose | `sessions` table |
 | "A routine runs the same loop on a schedule" | `--no-agent` cron sweep runs the same detect→judge→post path in one process | `gate.py` |
+| Replies "to channel messages it judges warrant a reply" as they arrive | debounced arrival-time judging on `pre_gateway_dispatch`, same prefilter, same judge, same send path | `aw_arrival.py` (dark by default) |
 | Agent identity — acts under its own account, not the asker | posts as the bot user | live |
 | DM → your own connectors, attributed to you | DMs are passed straight through to Hermes | `aw_recorder.decide` returns `PASS` for `chat_type=="dm"` |
 | Result lands in the asking thread | `aw_post` posts with `thread_ts`, `reply_broadcast=False` | live T7 |
@@ -43,19 +46,67 @@ non-JSON reply, schema violation or unsafe text yields silence, never a canned l
 Cooldowns and per-day caps are deleted, as Claude Tag has neither; the spend limit and
 the `last_activity_seen` re-judge watermark replace them.
 
+### CLOSED 2026-08-12 (code) — gap 1, trigger latency
+
+**Was:** *"Latency: we wait, Claude Tag doesn't."* Claude Tag replies *"to channel
+messages it judges warrant a reply"* as they arrive; our judge only ever saw a thread
+that had already been quiet for `min_age_minutes`. The judgment was equivalent; the
+trigger was not.
+
+**Now:** `aw_arrival.py` judges on message arrival, debounced, driven by the existing
+`pre_gateway_dispatch` hook. Latency goes from *up to `min_age_minutes` + up to one
+sweep interval* to `arrival_debounce_seconds` (90s) + up to `arrival_pump_interval_seconds`
+(5s) — roughly **45–60 minutes down to ~1.5 minutes**.
+
+Honest scoping of that claim, because "CLOSED" is doing a lot of work in a table:
+
+- **The trigger is closed; the code ships DARK.** `arrival_enabled` defaults `false`, so
+  the deployed behaviour is still sweep-only until an operator flips it and restarts the
+  gateway. Closed in this repo ≠ live on that machine.
+- **Not measured against a soak.** 90s is a judgment call, not evidence (see *Deliberate
+  divergences* below). The soak's job is to tell us whether humans routinely answer at
+  2–4 minutes, in which case the floor is spending our one post to lose a race.
+- **The sweep is NOT retired, and that is not legacy.** `stalled_thread` — "this decision
+  has been sitting for 45 minutes" — is unreachable by construction from an arrival
+  trigger. The sweep also recovers threads whose in-memory debounce state a gateway
+  restart lost, judges everything said during quiet hours, and is the only reporting
+  surface for arrival activity and budget alerts (the gateway has no `--deliver` and must
+  not open a second outbound Slack path). PARITY already maps the sweep onto Claude Tag's
+  *routine*, so keeping it is parity, not debt.
+- **The rate is now chosen by whoever posts.** The 15-minute cadence was an implicit rate
+  limit (≤96 judge calls/day, whatever anyone posted). Per-channel and global token
+  buckets are the *replacement* for it, not an optimisation — see the README's residual
+  risks.
+
 ### P0 — still not the same
 
-1. **Latency: we wait, Claude Tag doesn't.** Claude Tag replies *"to channel messages it
-   judges warrant a reply"* as they arrive. Our judge only ever sees a thread that has
-   already gone quiet for `min_age_minutes`. The judgment is now equivalent; the *trigger*
-   is not. Closing this means judging on message arrival (debounced, budget-gated) rather
-   than on a 15-minute sweep.
-2. **Capability breadth.** A Claude Tag session *"reads documents, runs code, builds
-   charts, and opens pull requests"* in a sandbox. Our ambient path is one LLM call that
-   emits one line of text — it cannot act. (Hermes' **mention** path has the full toolset
-   and is arguably more capable, but that is Hermes, not our ambient loop.)
+1. ~~**Latency**~~ — see above. Trigger closed in code, dark by default, sweep retained.
+2. **Capability breadth — OPEN, AND DELIBERATELY NOT SHIPPED.** A Claude Tag session
+   *"reads documents, runs code, builds charts, and opens pull requests"* in a sandbox.
+   Our ambient path is still one bounded, tool-less LLM call that emits one ≤200-character
+   line of text — it cannot act, on either trigger.
+
+   Arrival-time judging does **not** narrow this gap by a single tool, on purpose. The
+   obvious way to narrow it — handing a judged thread to a full-toolset Hermes agent
+   session ("escalation") — is **not implemented, not scaffolded, and not prepared for**:
+   no config key, no hook, no dead code path, no test. A prior attempt was stopped by a
+   safety review, and the reasoning still holds: autonomously routing
+   attacker-controllable channel text into a session holding `terminal`, `execute_code`
+   and `browser_*` is a **self-triggering code-execution surface**, and with arrival-time
+   judging the trigger is now chosen by whoever posts rather than by our own cadence —
+   which makes it *worse*, not better, than it would have been under the sweep. It stays
+   closed pending **explicit, informed human consent to that specific design**, which
+   nobody has given. Two further facts for whoever picks this up:
+   `ctx.inject_message` **does not work in the gateway** at all
+   (`hermes_cli/plugins.py:524-547` returns `False` when `_cli_ref is None`, which only
+   the interactive CLI sets), and Hermes' **mention** path already provides the full
+   toolset with a human explicitly asking for it — which is the consented version of this
+   capability and is arguably more capable than Claude Tag's sandbox.
 3. **Per-channel "Respond automatically" toggle**, changeable from the channel itself.
-   We have a global `channels` allowlist plus `hermes ambient mute`.
+   We have a global `channels` allowlist, a global `arrival_enabled`, plus
+   `hermes ambient mute`. If the per-channel toggle lands, `arrival_enabled` should
+   **merge** into it rather than compose with it — two global booleans layered on an
+   allowlist is one too many.
 
 ### P1 — context fidelity
 
@@ -108,4 +159,26 @@ the `last_activity_seen` re-judge watermark replace them.
 - **No cooldowns / daily nudge caps.** Claude Tag has neither; we deleted ours once the
   spend limit and the judge existed.
 - **Bot-authored messages never trigger.** Claude Tag's documented failure mode is
-  ignoring bot messages; for us that is a deliberate loop-safety rule.
+  ignoring bot messages; for us that is a deliberate loop-safety rule. With arrival-time
+  judging it is load-bearing rather than merely tidy: `decide()` returns `RECORD_SKIP` for
+  bot messages too, so without the explicit bot rung in `arrival_key` our own posted nudge
+  would re-trigger judgment on the thread it just landed in — and `has_intervention` would
+  stop the second *post*, making the symptom silent wasted spend rather than a visible
+  loop.
+- **A 90-second politeness floor on the arrival path.** This is a measurable divergence
+  from the spec: Claude Tag has no age gate, because it is a first-party product a channel
+  opted into. Ours is an unsolicited line from a bot that is otherwise silent, we get
+  exactly **one post per thread, ever**, and replying five seconds in spends that single
+  shot on a thread a colleague was already typing an answer to. So
+  `arrival_debounce_seconds` is deliberately *both* the debounce quiet period and the
+  politeness floor — one number, because they are the same requirement — and it is a
+  floor, not a wait: the trigger is arrival, not a tick. It is also free, since the
+  debounce has to exist anyway to coalesce a burst. **90s is my judgment, not evidence**;
+  the shadow soak can answer it empirically by logging how long after each arrival
+  judgment a human replied anyway. Lowering it below 30s is refused at config load.
+- **Two triggers, partitioned by age.** Arrival owns
+  `[arrival_debounce_seconds, min_age_minutes)`; the sweep owns `[min_age_minutes, ∞)`.
+  `load_config` clamps `arrival_max_wait_seconds` strictly below `min_age_minutes * 60` to
+  keep that true, so the two triggers cannot race over one thread's re-judge budget.
+  Claude Tag has one trigger; we have two because our second one does a job (stalled
+  threads, quiet-hours catch-up, restart recovery, ops reporting) the first cannot.

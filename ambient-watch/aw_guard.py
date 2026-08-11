@@ -63,6 +63,10 @@ _ARTIFACT_MARKERS = (
     "ambient.db",
     "candidates.json",
     "gate_errors.log",
+    # The arrival path's audit trail. It is excerpt-free by construction, but
+    # it lives in the data directory and the jail is absolute — no file in here
+    # is reachable from a tool call, in any session, for any principal.
+    "arrival.log",
     "config.json.lkg",
 )
 

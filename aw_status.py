@@ -158,6 +158,83 @@ def budget_section(db, cfg):
         ))
 
 
+def _json_flag(db, key) -> dict:
+    try:
+        row = db.execute("SELECT value FROM flags WHERE key=?", (key,)).fetchone()
+    except sqlite3.OperationalError:
+        return {}
+    if not row or not row["value"]:
+        return {}
+    try:
+        data = json.loads(row["value"])
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def arrival_section(db, cfg):
+    """Arrival-time judging: config, durable counters, and the audit tail.
+
+    THE HONEST CAVEAT, stated in the output itself: the pending map and the
+    rate buckets live in memory inside the GATEWAY process, so this CLI cannot
+    see them. What is visible here is only what the arrival path wrote down.
+    """
+    enabled = bool(cfg.get("arrival_enabled", False))
+    print("\nARRIVAL-TIME JUDGING (judge on message arrival, debounced)")
+    print(f"  arrival_enabled   : {'ON' if enabled else 'off (sweep-only)'}")
+    print(f"  debounce / floor  : {cfg.get('arrival_debounce_seconds', 90)}s"
+          "   (both the coalescing quiet period and the politeness floor)")
+    print(f"  max wait          : {cfg.get('arrival_max_wait_seconds', 300)}s"
+          "  (a never-quiet thread still gets judged once; 0 disables)")
+    print(f"  rate buckets      : {cfg.get('arrival_judgments_per_channel_hour', 4)}"
+          f"/hour per channel, {cfg.get('arrival_judgments_global_hour', 12)}/hour"
+          f" global, burst {cfg.get('arrival_burst', 2)}")
+    print(f"  pending cap       : {cfg.get('arrival_max_pending', 200)} thread(s)"
+          f", pump every {cfg.get('arrival_pump_interval_seconds', 5)}s")
+    print(f"  sweep window      : min_age_minutes="
+          f"{cfg.get('min_age_minutes', 45)} min -- SWEEP-ONLY. The two triggers")
+    print("                      partition by age: arrival owns [debounce,")
+    print("                      min_age_minutes), the sweep owns the rest and")
+    print("                      remains the stalled-thread trigger.")
+
+    counters = _json_flag(db, "arrival_counters")
+    reported = _json_flag(db, "arrival_reported")
+    if not counters:
+        print("  activity          : (none recorded)")
+    else:
+        keys = ("judged", "posted", "withheld", "declined", "throttled",
+                "shadow", "post_failed", "errors")
+        body = "  ".join(f"{k}={int(counters.get(k) or 0)}" for k in keys)
+        print(f"  activity (total)  : {body}")
+        print(f"  arrival spend     : ${float(counters.get('usd') or 0):.4f}"
+              " (already included in the SPEND totals above)")
+        if counters.get("updated_at"):
+            print(f"  last arrival act. : {ago(counters['updated_at'])}")
+        pending_report = {
+            k: int(counters.get(k) or 0) - int(reported.get(k) or 0) for k in keys
+        }
+        if any(v > 0 for v in pending_report.values()):
+            print("  not yet reported  : "
+                  + "  ".join(f"{k}={v}" for k, v in pending_report.items() if v > 0)
+                  + "  (the next sweep tick announces it)")
+
+    print("  NOT VISIBLE HERE  : the pending map and the rate buckets are"
+          " in-memory in the")
+    print("                      gateway process. A gateway restart loses"
+          " in-flight debounce")
+    print("                      state; the sweep is what recovers those"
+          " threads.")
+
+    log = DATA / "arrival.log"
+    if log.exists() and log.stat().st_size:
+        print(f"  {log} (tail):")
+        tail = log.read_text(encoding="utf-8", errors="replace").strip()
+        for line in tail.splitlines()[-8:]:
+            print(f"    {line}")
+    elif enabled:
+        print("  (no arrival.log yet -- nothing has been judged on arrival)")
+
+
 def judgment_section(db):
     print("\nJUDGE OUTCOMES (the model decides; a '?' regex no longer does)")
     try:
@@ -188,7 +265,7 @@ def status():
     print(f"  mode              : {cfg.get('mode')}")
     print(f"  watched channels  : {cfg.get('channels')}")
     print(f"  ops channel       : {cfg.get('ops_channel')}")
-    print(f"  min thread age    : {cfg.get('min_age_minutes', 45)} min")
+    print(f"  min thread age    : {cfg.get('min_age_minutes', 45)} min (sweep only)")
     print(f"  nominees per sweep: {cfg.get('candidates_per_run', 3)}")
     print(f"  judge threshold   : {cfg.get('judge_confidence_threshold', 0.7)}")
     print(f"  judge model       : {cfg.get('judge_model') or 'auxiliary.ambient_watch_judge'}")
@@ -210,6 +287,7 @@ def status():
     print(f"  kill switch       : {'ON (ambient halted)' if row and row['value']=='1' else 'off'}")
 
     budget_section(db, cfg)
+    arrival_section(db, cfg)
     judgment_section(db)
 
     print("\nRECORDED MESSAGES (L1-sanitized: inert, capped, injections redacted)")
@@ -283,9 +361,19 @@ def main() -> int:
                     db.execute(f"DELETE FROM {t}")
                 except sqlite3.OperationalError:
                     pass  # table from an older/newer schema, or already gone
+            try:
+                # Arrival counters are ledger state too; the kill switch is NOT
+                # (a reset must never silently re-arm a halted ambient mode).
+                db.execute(
+                    "DELETE FROM flags WHERE key IN"
+                    " ('arrival_counters','arrival_reported')"
+                )
+            except sqlite3.OperationalError:
+                pass
         db.close()
         (DATA / "candidates.json").unlink(missing_ok=True)
-        print("ledger wiped (config kept)")
+        (DATA / "arrival.log").unlink(missing_ok=True)
+        print("ledger wiped (config kept; kill switch untouched)")
 
     if not any((a.kill, a.mode, a.prod, a.reset_ledger)):
         status()

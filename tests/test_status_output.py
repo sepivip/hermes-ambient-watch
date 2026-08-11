@@ -134,6 +134,50 @@ def test_the_jail_message_does_not_advertise_an_unsanitized_route(cfg):
     assert "sanitiz" in JAIL_MESSAGE.casefold()
 
 
+def test_the_arrival_section_reports_state_and_admits_what_it_cannot_see(
+    seeded_home, capsys
+):
+    """The pending map and the rate buckets are in-memory in the GATEWAY
+    process, so this CLI genuinely cannot show them. Saying so is the point:
+    an operator who thinks 'pending: 0' means 'nothing queued' would read a
+    stalled pump as a quiet channel."""
+    data = seeded_home / "plugin-data" / "ambient_watch"
+    cfg = json.loads((data / "config.json").read_text(encoding="utf-8"))
+    cfg.update({"arrival_enabled": True, "arrival_debounce_seconds": 90})
+    (data / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+    store = AmbientStore(data / "ambient.db")
+    store.bump_arrival_counters(judged=4, posted=1, withheld=3, usd=0.06)
+    store.close()
+    (data / "arrival.log").write_text(
+        "[2026-08-12T00:00:00] arrival: POSTED to C0WATCHED1/1754900000.000000 "
+        "[unanswered_question]: I can find out who owns that.\n",
+        encoding="utf-8",
+    )
+
+    status = _load_status(seeded_home)
+    status.status()
+    out = capsys.readouterr().out
+
+    assert "ARRIVAL-TIME JUDGING" in out
+    assert "arrival_enabled   : ON" in out
+    assert "judged=4" in out and "posted=1" in out and "withheld=3" in out
+    assert "$0.0600" in out
+    assert "NOT VISIBLE HERE" in out and "in-memory" in out
+    assert "sweep only" in out, "min_age_minutes must be labelled sweep-scoped"
+    assert "POSTED to C0WATCHED1/1754900000.000000" in out, "the log tail"
+
+
+def test_the_arrival_section_is_quiet_and_honest_when_the_feature_is_dark(
+    seeded_home, capsys
+):
+    status = _load_status(seeded_home)
+    status.status()
+    out = capsys.readouterr().out
+    assert "off (sweep-only)" in out
+    assert "(none recorded)" in out
+
+
 def test_status_still_opens_a_ledger_written_by_the_real_store(seeded_home):
     """Guards the import-time sys.path insert: if aw_status could not find
     aw_sanitize, every message body would silently become a placeholder."""
