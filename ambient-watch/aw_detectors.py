@@ -94,6 +94,8 @@ def find_candidates(store, cfg, now: float) -> list[Candidate]:
                 continue
             if store.is_engaged(channel, root_ts):
                 continue  # the bot already converses there — never nudge
+            if cfg.mode == "shadow" and store.is_shadow_seen(channel, root_ts):
+                continue  # already reported in a shadow digest
 
             msgs = store.thread_messages(channel, root_ts)
             human_replies = [

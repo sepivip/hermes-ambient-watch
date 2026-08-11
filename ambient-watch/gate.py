@@ -209,6 +209,11 @@ def run_gate(cfg, store, now: float | None = None) -> str:
             for c in cands:
                 store.arm_intent(c.target, c.channel, c.thread_ts, now=now)
                 store.record_intervention(c.channel, c.thread_ts, kind=c.kind, now=now)
+        else:
+            # Shadow: mark reported so the same thread is not re-digested
+            # every sweep, WITHOUT consuming its real nudge budget.
+            for c in cands:
+                store.mark_shadow_seen(c.channel, c.thread_ts, now=now)
 
         lines.append(f"ambient-watch: {len(cands)} candidate(s) -> {out_path}")
         lines.append(json.dumps({"wakeAgent": True}))

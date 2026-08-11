@@ -60,6 +60,15 @@ CREATE TABLE IF NOT EXISTS flags (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+-- Shadow-mode "already reported" ledger. Kept separate from interventions
+-- so a shadow digest never consumes a thread's real nudge budget, while
+-- still preventing the same candidate being re-digested every sweep.
+CREATE TABLE IF NOT EXISTS shadow_seen (
+    channel    TEXT NOT NULL,
+    thread_ts  TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (channel, thread_ts)
+);
 """
 
 
@@ -189,6 +198,23 @@ class AmbientStore:
         if len(rows) < threshold:
             return False
         return all(r["engaged"] == 0 for r in rows)
+
+    # -- shadow-mode dedupe -----------------------------------------------
+    def mark_shadow_seen(self, channel, thread_ts, now=None):
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT OR IGNORE INTO shadow_seen (channel, thread_ts, created_at)"
+                " VALUES (?,?,?)",
+                (channel, thread_ts, now if now is not None else time.time()),
+            )
+
+    def is_shadow_seen(self, channel, thread_ts) -> bool:
+        with self._lock:
+            cur = self._db.execute(
+                "SELECT 1 FROM shadow_seen WHERE channel=? AND thread_ts=?",
+                (channel, thread_ts),
+            )
+            return cur.fetchone() is not None
 
     # -- mutes ------------------------------------------------------------
     def mute_thread(self, channel, thread_ts):
