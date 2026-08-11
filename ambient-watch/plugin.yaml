@@ -1,0 +1,6 @@
+name: ambient-watch
+version: 0.1.0
+description: >
+  Ambient mode for Slack: passively watches allowlisted channels, detects
+  stalled threads and unanswered questions, and (via a gated cron sweep)
+  posts one helpful nudge into the exact thread — shadow mode first.
