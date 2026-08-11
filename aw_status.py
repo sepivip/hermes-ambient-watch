@@ -112,17 +112,16 @@ def status():
     for i in it:
         print(f"  {i['status']:>8}  {i['target']}  {ago(i['created_at'])}")
 
-    cand = DATA / "candidates.json"
     print("\nLAST GATE OUTPUT")
-    if cand.exists():
-        c = json.loads(cand.read_text(encoding="utf-8"))
-        print(f"  generated {ago(c['generated_at'])}, mode={c['mode']}, "
-              f"{len(c['candidates'])} candidate(s)")
-        for x in c["candidates"]:
-            print(f"    [{x['kind']}] {x['target']}")
-            print(f"       excerpt: {x['excerpt'][:90]!r}")
-    else:
-        print("  (gate has not produced candidates yet)")
+    print("  Candidates are handed to the sweep on the gate's STDOUT and are")
+    print("  never written to disk (containment — see README). Read the shadow")
+    print("  digests in the ops channel or ~/hermes/cron/output/. Running the")
+    print("  gate shim by hand prints the payload, but performs a REAL sweep.")
+    stale = DATA / "candidates.json"
+    if stale.exists():
+        print(f"  !! stale pre-containment file present: {stale}")
+        print("     it holds verbatim channel text; the next gate run or")
+        print("     Hermes restart purges it (or delete it by hand now).")
 
     errs = DATA / "gate_errors.log"
     if errs.exists() and errs.stat().st_size:

@@ -19,7 +19,13 @@ from pathlib import Path
 from conftest import WATCHED, make_event
 
 from aw_recorder import decide
-from gate import ERROR_LOG_NAME, INTENT_TTL_SECONDS, install_gate, run_gate
+from gate import (
+    ERROR_LOG_NAME,
+    INTENT_TTL_SECONDS,
+    install_gate,
+    parse_candidates,
+    run_gate,
+)
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent / "ambient-watch"
 
@@ -43,7 +49,11 @@ def test_shadow_mode_wakes_agent_but_arms_nothing(cfg, store):
     _seed_question(cfg, store)
     out = run_gate(cfg, store, now=T0 + 46 * 60)
     assert _last_json(out) == {"wakeAgent": True}
-    payload = json.loads((cfg.data_dir / "candidates.json").read_text(encoding="utf-8"))
+    # The payload rides on stdout, never on disk — see tests/test_containment.py
+    # and the containment section of the README. Asserting against a file here
+    # would re-pin the contract that leaked on 2026-08-11.
+    payload = parse_candidates(out)
+    assert not (cfg.data_dir / "candidates.json").exists()
     assert payload["mode"] == "shadow"
     assert payload["candidates"][0]["target"] == f"slack:{WATCHED}:{T0:.6f}"
     assert "who owns the migration runbook?" in payload["candidates"][0]["excerpt"]

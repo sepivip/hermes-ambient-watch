@@ -12,6 +12,11 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+try:  # real loader: package-relative
+    from . import aw_sanitize
+except ImportError:  # cron shim: flat import after sys.path.insert(plugin_dir)
+    import aw_sanitize
+
 logger = logging.getLogger("ambient_watch")
 
 _ASK_LANGUAGE = re.compile(
@@ -138,9 +143,12 @@ def find_candidates(store, cfg, now: float) -> list[Candidate]:
             if kind is None:
                 continue
 
-            excerpt = " | ".join(
-                (m["text"] or "")[:280] for m in msgs[:6]
-            )
+            # The excerpt is the ONLY untrusted text that leaves this
+            # plugin. It is neutralized here, at the point of creation,
+            # because every downstream copy (the cron prompt, Hermes'
+            # FTS-indexed message rows, cron/output/*.md) is permanent and
+            # readable by sessions holding terminal/write_file/cronjob.
+            excerpt = aw_sanitize.build_excerpt(m["text"] for m in msgs[:6])
             out.append(
                 Candidate(
                     channel=channel,

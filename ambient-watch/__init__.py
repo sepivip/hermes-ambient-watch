@@ -23,10 +23,10 @@ import shutil
 from pathlib import Path
 
 from .aw_config import hermes_home, load_config
-from .aw_guard import check_tool_call
+from .aw_guard import check_tool_call, looks_sensitive
 from .aw_recorder import Decision, decide
 from .aw_store import AmbientStore
-from .gate import install_gate
+from .gate import install_gate, purge_untrusted_artifacts
 
 logger = logging.getLogger("ambient_watch")
 
@@ -142,6 +142,14 @@ def register(ctx):
         install_gate()
     except Exception:
         logger.exception("ambient-watch: could not install the cron gate shim")
+    # Remediate a payload left on disk by a pre-containment build without
+    # waiting for the next sweep to come round.
+    if purge_untrusted_artifacts(cfg):
+        logger.warning(
+            "ambient-watch: purged a legacy candidates.json holding verbatim "
+            "channel text (it is no longer written; the sweep gets its "
+            "payload on the gate's stdout)"
+        )
     _warn_auth_posture()
 
     def on_pre_gateway_dispatch(event=None, **kwargs):
@@ -156,15 +164,31 @@ def register(ctx):
             return {"action": "skip", "reason": "ambient-watch: recorded"}
         return None
 
-    def on_pre_tool_call(tool_name="", args=None, **kwargs):
+    def on_pre_tool_call(tool_name="", args=None, session_id="", **kwargs):
+        args = args or {}
         try:
-            return check_tool_call(tool_name, args or {}, cfg, store)
+            return check_tool_call(tool_name, args, cfg, store, session_id=session_id)
         except Exception:
-            logger.exception("ambient-watch: tool guard error — blocking send")
+            logger.exception("ambient-watch: tool guard error — failing closed")
             if tool_name == "send_message":
                 return {
                     "action": "block",
                     "message": "ambient-watch: guard errored; send blocked (fail closed)",
+                }
+            # A guard bug must not re-open the data-directory jail: re-check
+            # with a cfg-free marker scan that cannot depend on the code that
+            # just threw.
+            try:
+                sensitive = looks_sensitive(args)
+            except Exception:
+                sensitive = True
+            if sensitive:
+                return {
+                    "action": "block",
+                    "message": (
+                        "ambient-watch: guard errored while checking a reference to "
+                        "the ambient data directory; blocked (fail closed)"
+                    ),
                 }
             return None
 

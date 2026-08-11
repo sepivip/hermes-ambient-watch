@@ -206,14 +206,48 @@ def test_candidate_present_wakes_the_agent():
     assert json.loads(_last_line(out)) == {"wakeAgent": True}, out
     assert scheduler._parse_wake_gate(out) is True, out
 
-    # The child resolved the TEMP home, not the real one.
-    payload = json.loads((DATA_DIR / "candidates.json").read_text(encoding="utf-8"))
-    assert payload["candidates"], payload
+    # Containment: the payload rides on stdout and NOTHING untrusted is left
+    # on disk. The child resolved the TEMP home, not the real one.
+    assert not (DATA_DIR / "candidates.json").exists()
+    payload = aw_gate.parse_candidates(out)
+    assert payload and payload["candidates"], out
     cand = payload["candidates"][0]
     assert cand["channel"] == CHANNEL
     assert cand["kind"] == "unanswered_question"
     assert cand["untrusted"] is True
     assert cand["target"].startswith(f"slack:{CHANNEL}:")
+    assert str(DATA_DIR) not in out and "candidates.json" not in out, out
+
+
+def test_compose_prompt_carries_the_payload_through_the_real_scheduler():
+    """End-to-end proof that removing the file did not break the sweep: the
+    REAL _build_job_prompt embeds the gate's stdout as "## Script Output",
+    so the compose session sees every candidate without any file tool."""
+    aw_gate.install_gate(hermes_home=HOME)
+    _reset_state()
+    _seed_candidate()
+    _require_scheduler()
+
+    ok, out = _run(SHIM_NAME)
+    assert ok is True, out
+
+    job = {
+        "id": "fe00907d72c6",
+        "name": "ambient-sweep",
+        "script": SHIM_NAME,
+        "prompt": "Summarize the ambient candidates.",
+    }
+    prompt = scheduler._build_job_prompt(job, prerun_script=(ok, out))
+    assert prompt, "scheduler produced no prompt"
+    assert "## Script Output" in prompt
+    assert aw_gate.CANDIDATES_BEGIN in prompt and aw_gate.CANDIDATES_END in prompt
+
+    payload = aw_gate.parse_candidates(prompt)
+    assert payload and payload["candidates"], prompt
+    assert payload["candidates"][0]["channel"] == CHANNEL
+    assert "who owns the deploy key?" in payload["candidates"][0]["excerpt"]
+    # …and the prompt still does not disclose where any of it lives on disk.
+    assert str(DATA_DIR) not in prompt, prompt
 
 
 def test_corrupt_config_still_exits_zero_and_gates_off():
