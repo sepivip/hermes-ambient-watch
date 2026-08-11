@@ -155,10 +155,9 @@ def decide(event, cfg, store) -> Decision:
             return Decision.RECORD_PASS
         if thread_ts and store.has_intervention(channel, thread_ts):
             # A human replied in a thread we nudged: engagement feedback for
-            # self-quiet, retire the intent, and let the conversation flow —
-            # stock Hermes would dispatch replies to bot-participated threads.
+            # self-quiet, and let the conversation flow — stock Hermes would
+            # dispatch replies to bot-participated threads.
             store.record_engagement(channel, thread_ts)
-            store.mark_intent_done(f"{channel}:{thread_ts}")
             store.mark_engaged(channel, thread_ts)
             return Decision.RECORD_PASS
         return Decision.RECORD_SKIP

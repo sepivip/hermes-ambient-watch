@@ -44,15 +44,18 @@ def _make_cfg(tmp_path, mode):
         mode=mode,
         ops_channel="C0AMBOPS11",
         data_dir=tmp_path,
-        unanswered_after_minutes=45,
-        stalled_after_minutes=240,
+        min_age_minutes=45,
         caps_per_thread=1,
-        caps_per_channel_per_day=3,
-        caps_global_per_day=8,
-        cooldown_minutes=120,
         quiet_start="20:00",
         quiet_end="09:00",
         quiet_tz="Asia/Tbilisi",
+        # Non-zero caps: Budget.decision() reports "unconfigured" (a decline)
+        # when every cap is zero, so a test config with no caps would silently
+        # exercise the decline path instead of the behaviour under test.
+        daily_usd_global=1.00,
+        daily_usd_per_channel=0.50,
+        monthly_usd_global=20.00,
+        prices={"judge-test-model": (5.0, 15.0)},
     )
 
 
@@ -63,7 +66,9 @@ def cfg(tmp_path):
 
 @pytest.fixture
 def live_cfg(tmp_path):
-    return _make_cfg(tmp_path, "live")
+    # A separate data dir from `cfg`: a test that uses both must not have the
+    # two modes silently sharing one ledger.
+    return _make_cfg(tmp_path / "live", "live")
 
 
 @pytest.fixture
@@ -71,6 +76,71 @@ def store(cfg):
     s = AmbientStore(cfg.data_dir / "ambient.db")
     yield s
     s.close()
+
+
+class FakeJudge:
+    """Stands in for aw_judge.judge — no network, no tokens, no money.
+
+    Records the nominees it was asked about, so a test can assert the judge
+    was NEVER called (the budget-decline path must cost nothing).
+    """
+
+    MODEL = "judge-test-model"
+
+    def __init__(self, should_post=True, confidence=0.9, nudge="Anyone able to unblock this?",
+                 prompt_tokens=1000, completion_tokens=200, error="", raise_exc=None):
+        self.calls = []
+        self.should_post = should_post
+        self.confidence = confidence
+        self.nudge = nudge
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        self.error = error
+        self.raise_exc = raise_exc
+
+    def __call__(self, nominees, cfg):
+        from aw_judge import JudgeResult, Verdict
+
+        self.calls.append(list(nominees))
+        if self.raise_exc is not None:
+            # aw_judge.judge itself never raises; a fake that does proves the
+            # gate's own fail-closed path, not just the judge's.
+            raise self.raise_exc
+        return JudgeResult(
+            # Mirrors the real judge: an error yields no verdicts at all, so
+            # there is never a fallback nudge to post.
+            verdicts=[] if self.error else [
+                Verdict(
+                    channel=c.channel, thread_ts=c.thread_ts,
+                    should_post=self.should_post, confidence=self.confidence,
+                    reason="blocked on an answer", nudge=self.nudge,
+                )
+                for c in nominees
+            ],
+            model=self.MODEL,
+            prompt_tokens=self.prompt_tokens,
+            completion_tokens=self.completion_tokens,
+            error=self.error,
+        )
+
+
+@pytest.fixture
+def fake_judge():
+    return FakeJudge()
+
+
+class FakeTransport:
+    """Stands in for Slack chat.postMessage."""
+
+    def __init__(self, fail=False):
+        self.calls = []
+        self.fail = fail
+
+    def post(self, channel, thread_ts, text):
+        self.calls.append({"channel": channel, "thread_ts": thread_ts, "text": text})
+        if self.fail:
+            return {"ok": False, "error": "channel_not_found"}
+        return {"ok": True, "ts": "1754999999.000001"}
 
 
 def make_event(

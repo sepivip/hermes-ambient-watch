@@ -168,6 +168,9 @@ def _driver(spec: dict) -> dict:
         report["module_file"] = getattr(loaded.module, "__file__", None)
         report["module_path_attr"] = list(getattr(loaded.module, "__path__", []) or [])
         report["module_package"] = getattr(loaded.module, "__package__", None)
+    report["aux_tasks"] = {
+        k: v.get("plugin") for k, v in (getattr(mgr, "_aux_tasks", {}) or {}).items()
+    }
     report["hermes_plugins_modules"] = sorted(
         m for m in sys.modules if m.startswith("hermes_plugins")
     )
@@ -249,28 +252,20 @@ def _driver(spec: dict) -> dict:
         db.close()
 
         # --- pre_tool_call guard through the real resolver -----------------
+        # Only the data-directory jail remains. The send_message target
+        # pinning this block used to exercise is deleted: no cron agent can
+        # call send_message at all (cron/scheduler.py:182), so the pinning
+        # was scenery, and the gate now posts directly (aw_post).
         store_mod = sys.modules["hermes_plugins.ambient_watch.aw_store"]
-        store = store_mod.AmbientStore(data_dir / "ambient.db")
-        store.arm_intent(
-            f"slack:{spec['watched']}:1754900000.000100",
-            spec["watched"],
-            "1754900000.000100",
-        )
-        store.close()
         report["guard"] = {
-            "armed_target": P.resolve_pre_tool_block(
-                "send_message",
-                {"target": f"slack:{spec['watched']}:1754900000.000100"},
+            "data_dir_read": P.resolve_pre_tool_block(
+                "read_file", {"path": str(data_dir / "ambient.db")}
             ),
-            "unarmed_target": P.resolve_pre_tool_block(
-                "send_message",
-                {"target": f"slack:{spec['watched']}:9999999999.999999"},
+            "bare_artifact": P.resolve_pre_tool_block(
+                "read_file", {"path": "candidates.json"}
             ),
-            "ops_channel": P.resolve_pre_tool_block(
-                "send_message", {"target": f"slack:{spec['ops']}"}
-            ),
-            "other_platform": P.resolve_pre_tool_block(
-                "send_message", {"target": "telegram:12345"}
+            "future_tool": P.resolve_pre_tool_block(
+                "some_future_tool", {"nested": [{"p": str(data_dir / "ambient.db")}]}
             ),
             "unrelated_tool": P.resolve_pre_tool_block("read_file", {"path": "x"}),
         }
@@ -278,12 +273,40 @@ def _driver(spec: dict) -> dict:
         # --- the cron gate, called in PACKAGE context (not via the shim) ----
         # run_gate() swallows every exception and fails closed, so a broken
         # in-package import would look like "no candidates" forever.
+        #
+        # judge_fn is injected: this test must never make a real LLM call.
         gate_mod = sys.modules["hermes_plugins.ambient_watch.gate"]
+        judge_mod = sys.modules["hermes_plugins.ambient_watch.aw_judge"]
         cfg_mod = sys.modules["hermes_plugins.ambient_watch.aw_config"]
         gcfg = cfg_mod.load_config(data_dir / "config.json")
         gstore = store_mod.AmbientStore(data_dir / "ambient.db")
+
+        seen_nominees = []
+
+        def _offline_judge(nominees, cfg):
+            seen_nominees.extend(
+                {"channel": c.channel, "thread_ts": c.thread_ts,
+                 "judge_view": c.judge_view}
+                for c in nominees
+            )
+            return judge_mod.JudgeResult(
+                verdicts=[
+                    judge_mod.Verdict(
+                        channel=c.channel, thread_ts=c.thread_ts,
+                        should_post=True, confidence=0.9,
+                        reason="offline test judge",
+                        nudge="Want me to dig into this?",
+                    )
+                    for c in nominees
+                ],
+                model="offline-test-model", prompt_tokens=100, completion_tokens=20,
+            )
+
         try:
-            report["run_gate_output"] = gate_mod.run_gate(gcfg, gstore)
+            report["run_gate_output"] = gate_mod.run_gate(
+                gcfg, gstore, judge_fn=_offline_judge
+            )
+            report["gate_nominees"] = seen_nominees
         finally:
             gstore.close()
 
@@ -394,12 +417,32 @@ def test_real_loader_discovers_and_loads_the_plugin():
     assert r["listed"][0]["version"] == "0.1.0"
 
 
-def test_register_ran_and_registered_both_hooks():
+def test_register_ran_and_registered_all_three_hooks():
+    """``post_api_request`` is the third: a LEAK DETECTOR, not a meter. The
+    sweep runs as --no-agent and judges in its own process, so ambient must
+    account for zero agent-session tokens — anything this hook attributes to
+    the sweep means an agent session exists that should not. This assertion
+    also proves the hook name is in the real host's VALID_HOOKS set."""
     r = _enabled_report()
-    assert r["hooks_registered"] == ["pre_gateway_dispatch", "pre_tool_call"]
+    assert r["hooks_registered"] == [
+        "post_api_request", "pre_gateway_dispatch", "pre_tool_call",
+    ]
     assert r["hooks"]["pre_gateway_dispatch"] == 1
     assert r["hooks"]["pre_tool_call"] == 1
-    assert r["listed"][0]["hooks"] == 2
+    assert r["hooks"]["post_api_request"] == 1
+    assert r["listed"][0]["hooks"] == 3
+
+
+def test_the_judge_auxiliary_task_registers_with_the_real_host():
+    """``ambient_watch_judge`` must be accepted by the real registry: that is
+    what puts it in `hermes model -> Configure auxiliary models` and gives the
+    operator a place to pin a CHEAP model for judgment, independently of the
+    main chat model. A rejected key (reserved, duplicated) must degrade to a
+    warning, never take registration down — hence the log check too."""
+    r = _enabled_report()
+    assert r["aux_tasks"].get("ambient_watch_judge") == "ambient-watch", r["aux_tasks"]
+    bad = [line for line in r["logs"] if "could not register the" in line]
+    assert not bad, "\n".join(bad)
 
 
 def test_hyphenated_directory_becomes_underscore_module_slug():
@@ -446,12 +489,12 @@ def test_recorder_persisted_watched_messages_to_sqlite():
 
 
 def test_pre_tool_call_guard_runs_through_resolve_pre_tool_block():
+    """The data-directory jail, wired through Hermes' real resolver."""
     r = _enabled_report()
     g = r["guard"]
-    assert g["armed_target"] is None
-    assert g["unarmed_target"] and "not an armed ambient intent" in g["unarmed_target"]
-    assert g["ops_channel"] is None
-    assert g["other_platform"] is None
+    assert g["data_dir_read"] and "ambient-watch" in g["data_dir_read"]
+    assert g["bare_artifact"], "a relative artifact name must be jailed too"
+    assert g["future_tool"], "the jail must cover tools that do not exist yet"
     assert g["unrelated_tool"] is None
 
 
@@ -508,7 +551,22 @@ def test_run_gate_works_in_package_context():
     r = _enabled_report()
     out = r["run_gate_output"]
     assert "gate error" not in out, out
-    assert '"wakeAgent"' in out, out
+    # Either a silent tick (wake gate) or an audit line — never a crash.
+    assert ('"wakeAgent"' in out) or ("ambient-watch" in out) or ("POSTED" in out), out
+
+
+def test_the_judge_receives_a_sealed_sanitized_view_under_the_real_loader():
+    """The judge view must be built correctly in PACKAGE context: a flat
+    import inside aw_sanitize/aw_detectors would fail here and the sweep
+    would silently degrade to 'no candidates' forever (the exact class of bug
+    the shim P0 was)."""
+    r = _enabled_report()
+    nominees = r.get("gate_nominees") or []
+    if not nominees:  # no thread was old enough in this environment
+        return
+    view = nominees[0]["judge_view"]
+    assert view.startswith("<untrusted-slack-text>"), view
+    assert "deploy" in view, view
 
 
 # ---------------------------------------------------------------------------

@@ -17,7 +17,7 @@ we nudge, Claude Tag answers.**
 | "Once a session is active in a thread, it belongs to everyone there" | `thread_sessions_per_user` defaults **False** → threads shared, `[sender name]` prefixes, "Multi-user thread" prompt note | `gateway/session.py:1119-1123` |
 | "Two threads in the same channel are two separate sessions" | `thread_id` participates in the session key | `build_session_key` |
 | "The thread is durable; the sandbox is not" | Hermes sessions persist in sqlite; no sandbox to lose | `sessions` table |
-| "A routine runs the same loop on a schedule" | cron sweep runs the same detect→judge→post path | `aw_sweep.py` |
+| "A routine runs the same loop on a schedule" | `--no-agent` cron sweep runs the same detect→judge→post path in one process | `gate.py` |
 | Agent identity — acts under its own account, not the asker | posts as the bot user | live |
 | DM → your own connectors, attributed to you | DMs are passed straight through to Hermes | `aw_recorder.decide` returns `PASS` for `chat_type=="dm"` |
 | Result lands in the asking thread | `aw_post` posts with `thread_ts`, `reply_broadcast=False` | live T7 |

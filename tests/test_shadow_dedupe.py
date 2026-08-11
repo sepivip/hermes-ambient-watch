@@ -1,22 +1,22 @@
 """Shadow mode must digest each thread once, without burning nudge budget.
 
 The adversarial review correctly made shadow mode record NO interventions,
-so a digest never consumes a thread's once-per-thread budget or the
-per-channel daily cap. The unintended consequence: nothing marks the
-thread as already-reported, so every sweep re-emits the identical
-candidate. At a 15-minute cadence that is ~96 duplicate digests per day
-per thread — the ops channel becomes unreadable and the soak's precision
-measurement is meaningless.
+so a digest never consumes a thread's once-per-thread budget. The unintended
+consequence: nothing marked the thread as already-reported, so every sweep
+re-emitted the identical candidate. At a 15-minute cadence that is ~96
+duplicate digests per day per thread — the ops channel becomes unreadable,
+the soak's precision measurement is meaningless, and (now that judgment
+costs money) it is also ~96 LLM calls for one thread.
 
-Fix: a separate shadow_seen ledger. Shadow sweeps mark threads seen and
-skip them next time; live mode is unaffected (it uses interventions).
+Fix: a separate shadow_seen ledger. Shadow sweeps mark threads seen and skip
+them next time; live mode is unaffected (it uses interventions).
 """
 
-from conftest import WATCHED, make_event
+from conftest import WATCHED, FakeJudge, FakeTransport, make_event
 
 from aw_detectors import find_candidates
 from aw_recorder import decide
-from gate import run_gate
+from gate import WAKE_FALSE, run_gate
 
 T0 = 1754900000.0
 
@@ -25,9 +25,13 @@ def _seed(store, cfg, text, ts):
     decide(make_event(text=text, ts=f"{ts:.6f}"), cfg, store)
 
 
+def _silent(out):
+    return [ln for ln in out.splitlines() if ln.strip()][-1] == WAKE_FALSE
+
+
 def test_shadow_sweep_marks_thread_seen(cfg, store):
     _seed(store, cfg, "who owns the runbook?", T0)
-    run_gate(cfg, store, now=T0 + 46 * 60)
+    run_gate(cfg, store, now=T0 + 46 * 60, judge_fn=FakeJudge(), transport=FakeTransport())
     assert store.is_shadow_seen(WATCHED, f"{T0:.6f}") is True
     # and it did NOT burn the real nudge budget
     assert store.has_intervention(WATCHED, f"{T0:.6f}") is False
@@ -35,10 +39,12 @@ def test_shadow_sweep_marks_thread_seen(cfg, store):
 
 def test_second_shadow_sweep_finds_nothing(cfg, store):
     _seed(store, cfg, "who owns the runbook?", T0)
-    first = run_gate(cfg, store, now=T0 + 46 * 60)
-    assert '"wakeAgent": true' in first
-    second = run_gate(cfg, store, now=T0 + 48 * 60)
-    assert '"wakeAgent": false' in second, "duplicate digest for the same thread"
+    judge = FakeJudge()
+    first = run_gate(cfg, store, now=T0 + 46 * 60, judge_fn=judge, transport=FakeTransport())
+    assert "WOULD HAVE POSTED" in first
+    second = run_gate(cfg, store, now=T0 + 48 * 60, judge_fn=judge, transport=FakeTransport())
+    assert _silent(second), "duplicate digest for the same thread"
+    assert len(judge.calls) == 1, "and it must not cost a second judge call"
 
 
 def test_detectors_exclude_shadow_seen_threads(cfg, store):
@@ -62,9 +68,10 @@ def test_live_mode_does_not_use_shadow_seen(live_cfg):
 
 
 def test_new_thread_still_digested_after_a_seen_one(cfg, store):
-    cfg.cooldown_minutes = 0  # isolating dedupe from the cooldown gate
     _seed(store, cfg, "first question?", T0)
-    run_gate(cfg, store, now=T0 + 46 * 60)
+    judge = FakeJudge()
+    run_gate(cfg, store, now=T0 + 46 * 60, judge_fn=judge, transport=FakeTransport())
     _seed(store, cfg, "second unrelated question?", T0 + 60 * 60)
-    out = run_gate(cfg, store, now=T0 + 2 * 60 * 60)
-    assert '"wakeAgent": true' in out
+    out = run_gate(cfg, store, now=T0 + 2 * 60 * 60, judge_fn=judge, transport=FakeTransport())
+    assert "WOULD HAVE POSTED" in out
+    assert len(judge.calls) == 2

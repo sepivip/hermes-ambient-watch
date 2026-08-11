@@ -1,7 +1,23 @@
-"""Tool guard: the data-directory jail (L3) plus send_message target pinning.
+"""Tool guard: the unconditional data-directory jail (L3).
 
-L3 — DATA-DIRECTORY JAIL
-------------------------
+WHAT WAS DELETED, AND WHY IT WAS NEVER A CONTROL. This module also used to
+pin ``send_message`` targets to an "armed intent" ledger, so that a compose
+agent could only post into the thread the sweep had nominated. That control
+could never fire: ``send_message`` is not in Hermes' core agent toolset, and
+``cron/scheduler.py:182`` hardcodes ``messaging`` into every cron session's
+disabled toolsets, with user config layering on top — no cron agent can send
+a Slack message at all. The pinning was not "dormant"; it was scenery. It is
+gone, along with the ``intents`` ledger that fed it.
+
+The invariant it was meant to express is real, so it moved to where it can
+actually fire: ``aw_post.post_nudge`` enforces watched-channel-only,
+thread-must-exist-in-our-ledger, once-per-thread, not-muted,
+not-already-answered, live-mode-only and text-must-pass-``sanitize_nudge``
+in the ACTUAL send path. A check on a tool nobody can call is worse than no
+check, because it reads like protection in a review.
+
+L3 — DATA-DIRECTORY JAIL (this is the layer that fires)
+-------------------------------------------------------
 No agent session may reference the ambient data directory from any tool
 call. There is deliberately **no principal exemption**, not even for the
 cron sweep: once the gate hands its payload over on stdout (see gate.py),
@@ -24,27 +40,9 @@ precisely the mistake ``_UNTRUSTED_TOOL_NAMES`` makes upstream
 next. Markers include the distinctive directory segments, the artifact
 basenames (the cron job's ``--workdir`` IS the data dir, so a relative
 ``candidates.json`` needs no path at all), and 8.3 short-name forms.
-
-L2 — SEND_MESSAGE TARGET PINNING
---------------------------------
-Real send_message target grammar (tools/send_message_tool.py:221, :365):
-``platform``, ``platform:chat_id``, or ``platform:chat_id:thread_id`` —
-platform prefix FIRST. A Slack thread post is ``slack:C…:<thread_ts>``.
-Armed intents are stored as bare refs ``C…:<thread_ts>``.
-
-While intents are (or ever were) armed, sends INTO a watched channel must
-match a pending intent; ambiguous name-form slack targets are blocked
-outright (fail closed — a name can resolve into a watched channel after
-directory lookup, evading an ID comparison).
-
-NOTE: ``send_message`` is not in Hermes' core agent toolset on this build,
-so the pinning half is dormant in practice and must not be mistaken for a
-containment control. The jail above is the one that fires.
 """
 
 from __future__ import annotations
-
-_ID_PREFIXES = ("C", "G")
 
 # Distinctive path fragments of the ambient data directory. `plugin-data`
 # is included on purpose: nothing an agent legitimately does needs to reach
@@ -74,8 +72,10 @@ JAIL_MESSAGE = (
     "session. It stores VERBATIM untrusted Slack text from watched channels; "
     "a full-toolset session reading it is the exact incident this jail "
     "exists to prevent. The cron sweep receives its candidates on the gate's "
-    "stdout and needs no file access. Operators: run `python aw_status.py` "
-    "in a terminal instead."
+    "stdout and needs no file access. Operators, at a terminal you are sitting "
+    "at yourself: `python aw_status.py` (it prints the ledger through the same "
+    "L1 sanitizer, precisely because this jail cannot tell a human's terminal "
+    "from an agent's)."
 )
 
 # Keep the scan cheap — it runs on every tool call in every session.
@@ -159,56 +159,12 @@ def looks_sensitive(args) -> bool:
     return any(m in blob for m in _DIR_MARKERS + _ARTIFACT_MARKERS)
 
 
-def check_tool_call(tool_name: str, args: dict, cfg, store, session_id: str = ""):
-    args = args or {}
+def check_tool_call(tool_name: str, args: dict, cfg, store=None, session_id: str = ""):
+    """The plugin's whole pre_tool_call verdict: the jail, for every tool.
 
-    # L3 first, and for every tool: the jail has no exemptions, so nothing
-    # below it can widen the boundary.
-    verdict = data_dir_jail(tool_name, args, cfg)
-    if verdict is not None:
-        return verdict
-
-    if tool_name != "send_message":
-        return None
-    if not store.any_intents():
-        return None  # never armed -> dormant
-
-    target = str(args.get("target") or args.get("to") or "")
-    platform, _, ref = target.partition(":")
-    if platform.strip().lower() != "slack":
-        return None  # other platforms are not ambient's business
-    ref = ref.strip()
-    channel_part = ref.split(":", 1)[0].strip()
-
-    if channel_part == cfg.ops_channel:
-        return None  # shadow digests / ops alerts always allowed
-
-    id_form = (
-        len(channel_part) >= 9
-        and channel_part[:1] in _ID_PREFIXES
-        and channel_part.isalnum()
-    )
-    if not id_form:
-        # "slack:#name" / "slack:@handle" / bare "slack" while armed:
-        # cannot be compared against the channel allowlist -> fail closed.
-        return {
-            "action": "block",
-            "message": (
-                f"ambient-watch: ambiguous slack target {target!r} while ambient "
-                "intents are armed. Use an explicit channel-ID target."
-            ),
-        }
-    if channel_part not in cfg.channels:
-        return None  # not a watched channel
-
-    pending = set(store.pending_intents())
-    if ref in pending:
-        return None
-    return {
-        "action": "block",
-        "message": (
-            f"ambient-watch: send_message target {target!r} is not an armed "
-            "ambient intent for this watched channel. Allowed targets: "
-            + (", ".join(f"slack:{p}" for p in sorted(pending)) if pending else "(none)")
-        ),
-    }
+    ``store`` and ``session_id`` are accepted and deliberately unused — the
+    jail has no principal check, because a ``session_id.startswith("cron_")``
+    style carve-out would admit every cron job on the machine and would still
+    be a string comparison an attacker can aim at.
+    """
+    return data_dir_jail(tool_name, args or {}, cfg)

@@ -1,5 +1,25 @@
 """L1 of the containment design: neutralize untrusted channel text.
 
+TWO DIRECTIONS, TWO PROFILES. Since the judge landed, untrusted text moves
+both ways and each direction needs its own sanitizer:
+
+* INBOUND — ``build_judge_view`` builds what the judge model reads. It is
+  richer than the export profile (12 messages x 400 chars, pseudonymous
+  authors, relative timestamps) because it is never persisted by Hermes:
+  it lives in this process's memory and in one HTTPS request body. The
+  export profile's tight caps existed because every downstream copy was
+  permanent; that rationale does not apply here. Instruction-shaped text is
+  still WITHHELD — the judge's output is text we post into a public
+  channel, so an injected judge is the worst case in the whole system.
+* OUTBOUND — ``sanitize_nudge`` gates what the judge wrote before it is
+  posted. The nudge is model-authored but attacker-INFLUENCED; without this
+  the judge is a laundering path (hostile text in, relayed text out, posted
+  by us). It fails closed: anything suspicious returns None, which the gate
+  turns into silence rather than a post.
+* ``build_excerpt`` remains the compact export profile, stored in the
+  judgments ledger so an operator reviewing a shadow soak in a terminal can
+  see the thread next to the nudge it would have produced.
+
 Every excerpt the sweep sees is VERBATIM text an attacker chose. Any
 consumer of it may be a full-toolset agent session — the live 2026-08-11
 incident proved that, and Hermes' own promptware defence does not cover
@@ -47,6 +67,15 @@ EMPTY = "[no quotable text]"
 MAX_MESSAGES = 4
 MAX_MESSAGE_CHARS = 120
 MAX_EXCERPT_CHARS = 480
+
+# Inbound (judge) profile. Bigger because nothing persists it: the view is a
+# local variable and a request body, never a Hermes message row.
+JUDGE_MAX_MESSAGES = 12
+JUDGE_MAX_MESSAGE_CHARS = 400
+JUDGE_MAX_VIEW_CHARS = 2400
+
+# Outbound (nudge) profile — one short sentence, posted publicly.
+NUDGE_MAX_CHARS = 200
 
 # Structure-forging characters. `<>` = our delimiters and Slack's link /
 # mention syntax; backtick = cron's script-output fence and shell command
@@ -122,15 +151,15 @@ def is_instruction_shaped(text: str) -> bool:
     return bool(_INJECTION.search(raw) or _INJECTION.search(_clean(raw)))
 
 
-def neutralize(text: str) -> str:
+def neutralize(text: str, max_chars: int = MAX_MESSAGE_CHARS) -> str:
     """One channel message -> inert, capped, single-line text (or REDACTED)."""
     cleaned = _clean(text or "")
     if not cleaned:
         return ""
     if is_instruction_shaped(text or "") or is_instruction_shaped(cleaned):
         return REDACTED
-    if len(cleaned) > MAX_MESSAGE_CHARS:
-        cleaned = cleaned[:MAX_MESSAGE_CHARS].rstrip() + "..."
+    if len(cleaned) > max_chars:
+        cleaned = cleaned[:max_chars].rstrip() + "..."
     return cleaned
 
 
@@ -149,3 +178,107 @@ def build_excerpt(texts) -> str:
     if _INJECTION.search(body.replace(REDACTED, "")):
         body = REDACTED
     return f"{DELIM_OPEN}{body}{DELIM_CLOSE}"
+
+
+def _relative(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds < 3600:
+        return f"+{int(seconds // 60)}m"
+    if seconds < 86400:
+        return f"+{int(seconds // 3600)}h"
+    return f"+{int(seconds // 86400)}d"
+
+
+def build_judge_view(messages) -> str:
+    """Build the INBOUND view the judge model reads.
+
+    ``messages`` may be store rows (dicts with ts/author/is_bot/text) or
+    bare strings. Authors become stable pseudonyms (``A1``, ``A2``, ``BOT``)
+    rather than Slack user ids — an id in the prompt is an invitation for the
+    model to @-mention someone, and the nudge must never do that. Times
+    become relative offsets, so the view carries no absolute identifiers at
+    all.
+
+    The delimiters are attached LAST, after every ``<``/``>`` is gone, so a
+    channel cannot forge its own container. Same guarantee as
+    ``build_excerpt``; only the caps differ.
+    """
+    rows = list(messages or [])
+    if not rows:
+        return f"{DELIM_OPEN}{EMPTY}{DELIM_CLOSE}"
+
+    # Root plus the most recent tail: the two ends of a thread are what a
+    # judgment actually needs.
+    if len(rows) > JUDGE_MAX_MESSAGES:
+        rows = rows[:1] + rows[-(JUDGE_MAX_MESSAGES - 1):]
+
+    base = None
+    for row in rows:
+        if isinstance(row, dict):
+            try:
+                base = float(row.get("ts"))
+                break
+            except (TypeError, ValueError):
+                continue
+
+    aliases: dict = {}
+    lines = []
+    for row in rows:
+        if isinstance(row, dict):
+            text = row.get("text")
+            author = row.get("author")
+            if row.get("is_bot"):
+                who = "BOT"
+            elif author is None:
+                who = "A?"
+            else:
+                who = aliases.setdefault(author, f"A{len(aliases) + 1}")
+            when = ""
+            try:
+                if base is not None:
+                    when = " " + _relative(float(row.get("ts")) - base)
+            except (TypeError, ValueError):
+                when = ""
+        else:
+            text, who, when = row, "A1", ""
+        body = neutralize(text, JUDGE_MAX_MESSAGE_CHARS)
+        if body:
+            lines.append(f"{who}{when}: {body}")
+
+    view = "\n".join(lines) if lines else EMPTY
+    if len(view) > JUDGE_MAX_VIEW_CHARS:
+        view = view[:JUDGE_MAX_VIEW_CHARS].rstrip() + "..."
+    # A pattern can be split across two messages and only appear once they
+    # are concatenated — same join re-check as the export profile.
+    if _INJECTION.search(view.replace(REDACTED, "")):
+        view = REDACTED
+    return f"{DELIM_OPEN}\n{view}\n{DELIM_CLOSE}"
+
+
+def sanitize_nudge(text: str):
+    """Gate the OUTBOUND nudge. Returns clean text, or None to stay silent.
+
+    The judge's wording is model-authored but attacker-influenced, and it is
+    about to be posted into a public channel under our name. Every check
+    fails closed, because the cost asymmetry is extreme: rejecting a good
+    nudge costs one skipped nudge, relaying a bad one is a public post we
+    cannot undo.
+    """
+    raw = text or ""
+    cleaned = _clean(raw)
+    if not cleaned:
+        return None
+    if is_instruction_shaped(raw) or is_instruction_shaped(cleaned):
+        return None
+    # _clean defangs URLs to a marker; its presence means there WAS a link.
+    if "(link removed)" in cleaned:
+        return None
+    # `<@U…>` loses its brackets in _clean but keeps the '@' — so this one
+    # check covers mentions, handles and e-mail addresses.
+    if "@" in cleaned:
+        return None
+    if REDACTED in cleaned or EMPTY in cleaned:
+        return None
+    if len(cleaned) > NUDGE_MAX_CHARS:
+        return None  # refuse rather than truncate mid-sentence
+    return cleaned

@@ -114,7 +114,11 @@ class Budget:
         now = time.time() if now is None else now
         checks = self._ratios(channel, now)
         if not checks:
-            return "ok"
+            # No cap configured anywhere. Returning "ok" here would be
+            # fail-OPEN: a detector bug plus an unconfigured budget is an
+            # unbounded bill, on a schedule, with no human in the loop. The
+            # gate treats this verdict as a decline.
+            return "unconfigured"
         top = max(r for r, _ in checks)
         if top >= 1.0:
             return "exceeded"
@@ -124,10 +128,42 @@ class Budget:
             return "alert75"
         return "ok"
 
+    def report(self, channels, now=None) -> dict:
+        """Operator-facing rollup: spend and cap ratios per scope."""
+        now = time.time() if now is None else now
+        day_start = now - DAY
+        month_start = now - 30 * DAY
+        return {
+            "daily_global": (self.spent_usd_global(day_start), self.daily_global),
+            "monthly_global": (self.spent_usd_global(month_start), self.monthly_global),
+            "daily_channel": {
+                c: (self.spent_usd_channel(c, day_start), self.daily_channel)
+                for c in sorted(channels or ())
+            },
+        }
+
     # -- alerts (fire once per threshold per period) ----------------------
     def _period_key(self, scope, now) -> str:
         bucket = int(now // (30 * DAY)) if scope.endswith("monthly") else int(now // DAY)
         return str(bucket)
+
+    def take_config_alert(self, now=None) -> bool:
+        """True at most once a day while NO cap is configured.
+
+        An unconfigured budget declines every candidate, so ambient goes
+        completely silent — the exact failure mode ("a broken gate looks like
+        a quiet week") the breadcrumb log exists to fight. This makes it audible
+        in the ops channel too, without turning a misconfiguration into 96
+        messages a day.
+        """
+        now = time.time() if now is None else now
+        with self._lock, self._db:
+            cur = self._db.execute(
+                "INSERT OR IGNORE INTO budget_alerts (scope, threshold, period_key)"
+                " VALUES ('global|config', 0.0, ?)",
+                (str(int(now // DAY)),),
+            )
+            return bool(cur.rowcount)
 
     def take_pending_alert(self, channel, now=None):
         """Return the highest newly-crossed threshold to announce, or None."""

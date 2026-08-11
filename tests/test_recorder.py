@@ -105,17 +105,17 @@ def test_unmentioned_new_thread_is_not_engaged(cfg, store):
 
 
 def test_reply_to_nudged_thread_passes_and_records_engagement(cfg, store):
-    """After we nudge a thread, a human reply must reach the agent, mark
-    the intervention engaged (self-quiet feedback), and retire the intent."""
+    """After we nudge a thread, a human reply must reach the agent and mark
+    the intervention engaged — that feedback is what resets self-quiet, which
+    is now one of only three noise controls left."""
     root = "1754900000.000100"
     decide(make_event(text="who owns the runbook?", ts=root), cfg, store)
     store.record_intervention(WATCHED, root, kind="unanswered_question", now=1754903000.0)
-    store.arm_intent(f"{WATCHED}:{root}", WATCHED, root, now=1754903000.0)
 
     reply = make_event(text="oh good point, it's mine", ts="1754903100.000200", thread_ts=root)
     assert decide(reply, cfg, store) is Decision.RECORD_PASS
     assert store.channel_self_quieted(WATCHED, threshold=1) is False  # engaged
-    assert f"{WATCHED}:{root}" not in store.pending_intents()
+    assert store.is_engaged(WATCHED, root) is True
 
 
 def test_bot_authored_message_is_recorded_as_bot_and_skipped(cfg, store):

@@ -49,13 +49,11 @@ CREATE TABLE IF NOT EXISTS muted (
     thread_ts TEXT NOT NULL,
     PRIMARY KEY (channel, thread_ts)
 );
-CREATE TABLE IF NOT EXISTS intents (
-    target     TEXT PRIMARY KEY,
-    channel    TEXT NOT NULL,
-    thread_ts  TEXT NOT NULL,
-    status     TEXT NOT NULL DEFAULT 'pending',
-    created_at REAL NOT NULL
-);
+-- NOTE: an `intents` table existed here to feed aw_guard's send_message
+-- target pinning. Both are gone: no cron agent can call send_message
+-- (cron/scheduler.py:182), the gate posts directly, and the outbound
+-- invariant now lives in aw_post.post_nudge where it can actually fire. A
+-- deployed database keeps the unused table; nothing reads or writes it.
 CREATE TABLE IF NOT EXISTS flags (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -67,6 +65,25 @@ CREATE TABLE IF NOT EXISTS shadow_seen (
     channel    TEXT NOT NULL,
     thread_ts  TEXT NOT NULL,
     created_at REAL NOT NULL,
+    PRIMARY KEY (channel, thread_ts)
+);
+-- Judge outcomes, one row per thread. `last_activity_seen` is the re-judge
+-- WATERMARK and it is what makes the deleted cooldown unnecessary: a thread
+-- the judge declined is not judged again until a NEW human message arrives,
+-- so a thread cannot cost repeated LLM calls merely by continuing to exist.
+-- `judge_count` bounds even that (cfg.judge_max_rejudge).
+CREATE TABLE IF NOT EXISTS judgments (
+    channel            TEXT NOT NULL,
+    thread_ts          TEXT NOT NULL,
+    verdict            TEXT NOT NULL,
+    confidence         REAL NOT NULL DEFAULT 0,
+    reason             TEXT,
+    nudge              TEXT,
+    excerpt            TEXT,
+    last_activity_seen REAL NOT NULL DEFAULT 0,
+    judge_count        INTEGER NOT NULL DEFAULT 0,
+    created_at         REAL NOT NULL,
+    updated_at         REAL NOT NULL,
     PRIMARY KEY (channel, thread_ts)
 );
 """
@@ -240,6 +257,86 @@ class AmbientStore:
             )
             return cur.fetchone()["m"]
 
+    # -- judgments (model verdicts + the re-judge watermark) --------------
+    def record_judgment(
+        self, channel, thread_ts, verdict, *, confidence=0.0, reason="",
+        nudge="", excerpt="", last_activity_seen=0.0, now=None,
+    ):
+        now = time.time() if now is None else now
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO judgments (channel, thread_ts, verdict, confidence,"
+                " reason, nudge, excerpt, last_activity_seen, judge_count,"
+                " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,1,?,?)"
+                " ON CONFLICT(channel, thread_ts) DO UPDATE SET"
+                "   verdict=excluded.verdict,"
+                "   confidence=excluded.confidence,"
+                "   reason=excluded.reason,"
+                "   nudge=excluded.nudge,"
+                "   excerpt=excluded.excerpt,"
+                "   last_activity_seen=MAX(judgments.last_activity_seen,"
+                "                          excluded.last_activity_seen),"
+                "   judge_count=judgments.judge_count + 1,"
+                "   updated_at=excluded.updated_at",
+                (channel, thread_ts, verdict, float(confidence), reason, nudge,
+                 excerpt, float(last_activity_seen), now, now),
+            )
+
+    def record_decline(self, channel, thread_ts, verdict, *, excerpt="", now=None):
+        """Note a candidate that was DECLINED without being judged.
+
+        A decline is not a verdict: no model saw the thread and no tokens were
+        spent, so it must not consume the re-judge watermark or the
+        ``judge_count``. Recording it as a judgment would permanently retire
+        the thread — the spend cap resets the next day (and a misconfigured
+        budget gets fixed by an operator) but the thread would never be looked
+        at again, which is the "ambient silently does nothing" failure mode
+        this plugin fears most.
+        """
+        now = time.time() if now is None else now
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO judgments (channel, thread_ts, verdict, confidence,"
+                " reason, nudge, excerpt, last_activity_seen, judge_count,"
+                " created_at, updated_at) VALUES (?,?,?,0,'','',?,0,0,?,?)"
+                " ON CONFLICT(channel, thread_ts) DO UPDATE SET"
+                "   verdict=excluded.verdict,"
+                "   excerpt=excluded.excerpt,"
+                "   updated_at=excluded.updated_at",
+                (channel, thread_ts, verdict, excerpt, now, now),
+            )
+
+    def judgment(self, channel, thread_ts):
+        with self._lock:
+            cur = self._db.execute(
+                "SELECT * FROM judgments WHERE channel=? AND thread_ts=?",
+                (channel, thread_ts),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def needs_judgment(self, channel, thread_ts, last_activity, max_rejudge) -> bool:
+        """True when this thread may be handed to the judge (again).
+
+        This is the control that replaced the cooldown. A thread already
+        judged is eligible only if a human said something NEW since, and only
+        up to ``max_rejudge`` extra times — so the judge's cost is bounded by
+        conversation, not by the sweep cadence.
+        """
+        row = self.judgment(channel, thread_ts)
+        if row is None:
+            return True
+        if float(last_activity) <= float(row["last_activity_seen"]):
+            return False  # nothing new since the last verdict
+        return int(row["judge_count"]) <= int(max_rejudge)
+
+    def recent_judgments(self, limit=10):
+        with self._lock:
+            cur = self._db.execute(
+                "SELECT * FROM judgments ORDER BY updated_at DESC LIMIT ?", (limit,)
+            )
+            return [dict(r) for r in cur.fetchall()]
+
     # -- mutes ------------------------------------------------------------
     def mute_thread(self, channel, thread_ts):
         with self._lock, self._db:
@@ -275,44 +372,6 @@ class AmbientStore:
     def is_channel_muted(self, channel) -> bool:
         return self.is_muted(channel, self._CHANNEL_MUTE)
 
-    # -- intents (tool-guard arming) --------------------------------------
-    def arm_intent(self, target, channel, thread_ts, now=None):
-        # target may arrive platform-prefixed from gate candidates; store bare.
-        ref = target.partition(":")[2] if target.startswith("slack:") else target
-        with self._lock, self._db:
-            self._db.execute(
-                "INSERT OR REPLACE INTO intents (target, channel, thread_ts, status, created_at)"
-                " VALUES (?,?,?,'pending',?)",
-                (ref, channel, thread_ts, now if now is not None else time.time()),
-            )
-
-    def pending_intents(self):
-        with self._lock:
-            cur = self._db.execute(
-                "SELECT target FROM intents WHERE status='pending' ORDER BY created_at"
-            )
-            return [r["target"] for r in cur.fetchall()]
-
-    def any_intents(self) -> bool:
-        with self._lock:
-            cur = self._db.execute("SELECT 1 FROM intents LIMIT 1")
-            return cur.fetchone() is not None
-
-    def mark_intent_done(self, target):
-        with self._lock, self._db:
-            self._db.execute(
-                "UPDATE intents SET status='done' WHERE target=?", (target,)
-            )
-
-    def expire_stale_intents(self, now: float, ttl_seconds: float) -> int:
-        with self._lock, self._db:
-            cur = self._db.execute(
-                "UPDATE intents SET status='expired'"
-                " WHERE status='pending' AND created_at < ?",
-                (now - ttl_seconds,),
-            )
-            return cur.rowcount
-
     # -- retention --------------------------------------------------------
     def prune(self, now: float, retention_days: int) -> int:
         """Delete expired message bodies and stale bookkeeping rows."""
@@ -321,9 +380,11 @@ class AmbientStore:
             removed = self._db.execute(
                 "DELETE FROM messages WHERE CAST(ts AS REAL) < ?", (cutoff,)
             ).rowcount
+            # Judgments of threads whose messages are gone carry no signal,
+            # but keep them while the thread is still in the ledger: the row
+            # is the once-per-thread + watermark memory.
             removed += self._db.execute(
-                "DELETE FROM intents WHERE status != 'pending' AND created_at < ?",
-                (cutoff,),
+                "DELETE FROM judgments WHERE updated_at < ?", (cutoff,)
             ).rowcount
             removed += self._db.execute(
                 "DELETE FROM engaged_threads WHERE NOT EXISTS ("

@@ -13,16 +13,23 @@ Contract being proven end to end:
 
 1. ``install_gate()`` puts the shim exactly where the jail will accept it.
 2. The real runner does NOT block it, and it exits 0 (rc != 0 makes the
-   scheduler wake the agent with a "Script Error" prompt every tick).
-3. No candidates  -> gate says wakeAgent=false -> agent skipped.
-4. A candidate    -> gate says wakeAgent=true  -> agent woken, and
-   candidates.json lands under the (temp) HERMES_HOME.
+   scheduler deliver a "script failed" alert every tick).
+3. Nothing to report -> ``{"wakeAgent": false}`` -> SILENT, stdout dropped.
+4. Something to report -> a non-JSON last line -> delivered verbatim to
+   ``--deliver``, and carrying NO channel text.
 5. Internal failure (unreadable / corrupt / missing config) STILL exits 0
-   with ``{"wakeAgent": false}`` — fail closed, never burn a session.
+   with ``{"wakeAgent": false}`` — fail closed, never shout.
 
 SAFETY: HERMES_HOME is redirected to a fresh temp dir *before* the scheduler
 is imported, and an assertion refuses to run if it ever points at the real
 Hermes home. Nothing here touches the user's live install.
+
+SAFETY, MONEY: the gate now makes an LLM call of its own. Every config this
+file writes sets all three spend caps to 0, which makes
+``Budget.decision()`` return ``"unconfigured"`` and the gate DECLINE every
+candidate before the judge is reached. So these tests exercise the real
+subprocess, the real path jail and the real wake gate while being provably
+incapable of spending a cent or opening a socket.
 
 Run it with the hermes venv interpreter (which has the hermes deps but no
 pytest), either way::
@@ -68,6 +75,7 @@ except Exception as exc:  # pragma: no cover - environment without hermes deps
     scheduler = None
     SCHEDULER_IMPORT_ERROR = exc
 
+import aw_judge  # noqa: E402
 import gate as aw_gate  # noqa: E402  (plugin under test)
 from aw_store import AmbientStore  # noqa: E402
 
@@ -97,13 +105,24 @@ def _write_config(**overrides):
         "mode": "shadow",
         "ops_channel": "C0AMBOPS11",
         "data_dir": str(DATA_DIR),
+        # RETIRED keys, kept here on purpose: a deployed config.json written
+        # before the parity work must still load (ignored with one warning),
+        # never crash the sweep on upgrade.
         "unanswered_after_minutes": 45,
         "stalled_after_minutes": 240,
+        "cooldown_minutes": 120,
+        "min_age_minutes": 45,
         # start == end -> _in_quiet_hours() is always False, so the gate's
         # verdict depends only on the ledger, not on when CI happens to run.
         "quiet_start": "00:00",
         "quiet_end": "00:00",
         "quiet_tz": "UTC",
+        # No spend cap -> Budget.decision() == "unconfigured" -> every
+        # candidate is declined BEFORE the judge, so this file can never make
+        # a real LLM call. See the module docstring.
+        "daily_usd_global": 0,
+        "daily_usd_per_channel": 0,
+        "monthly_usd_global": 0,
     }
     raw.update(overrides)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -123,7 +142,7 @@ def _reset_state():
 
 
 def _seed_candidate():
-    """One unanswered question, old enough to trip unanswered_after_minutes."""
+    """One quiet thread, old enough to pass min_age_minutes."""
     store = AmbientStore(DB_PATH)
     try:
         ts = f"{time.time() - 3600:.6f}"
@@ -196,58 +215,64 @@ def test_no_candidates_gates_the_agent_off():
     assert "no candidates" in out, out
 
 
-def test_candidate_present_wakes_the_agent():
+def test_a_candidate_produces_an_excerpt_free_audit_line_and_is_delivered():
+    """The --no-agent contract, through the real runner.
+
+    With no spend cap configured the gate declines the candidate before the
+    judge — which is exactly the shape we want to test: a non-silent tick
+    whose stdout the scheduler will hand to ``--deliver`` verbatim. That
+    stdout must carry the thread's coordinates and NOTHING the channel wrote,
+    because cron's ``save_job_output`` persists it under
+    ~/.hermes/cron/output/ where the L3 jail does not reach.
+    """
     aw_gate.install_gate(hermes_home=HOME)
     _reset_state()
     _seed_candidate()
 
     ok, out = _run(SHIM_NAME)
     assert ok is True, out
-    assert json.loads(_last_line(out)) == {"wakeAgent": True}, out
+    # Non-silent: the last line is NOT the wake gate, so cron delivers it.
     assert scheduler._parse_wake_gate(out) is True, out
+    assert "DECLINED" in out and CHANNEL in out, out
 
-    # Containment: the payload rides on stdout and NOTHING untrusted is left
-    # on disk. The child resolved the TEMP home, not the real one.
+    lowered = out.casefold()
+    for leak in ("who owns the deploy key", "blocked until someone answers",
+                 "untrusted-slack-text", "excerpt"):
+        assert leak not in lowered, leak
     assert not (DATA_DIR / "candidates.json").exists()
-    payload = aw_gate.parse_candidates(out)
-    assert payload and payload["candidates"], out
-    cand = payload["candidates"][0]
-    assert cand["channel"] == CHANNEL
-    assert cand["kind"] == "unanswered_question"
-    assert cand["untrusted"] is True
-    assert cand["target"].startswith(f"slack:{CHANNEL}:")
     assert str(DATA_DIR) not in out and "candidates.json" not in out, out
 
 
-def test_compose_prompt_carries_the_payload_through_the_real_scheduler():
-    """End-to-end proof that removing the file did not break the sweep: the
-    REAL _build_job_prompt embeds the gate's stdout as "## Script Output",
-    so the compose session sees every candidate without any file tool."""
+def test_the_real_wake_gate_agrees_with_both_output_shapes():
+    """The two shapes the gate emits, checked against the REAL parser that
+    decides whether cron delivers or stays silent (cron/scheduler.py:2574,
+    called for no_agent jobs at :3279)."""
     aw_gate.install_gate(hermes_home=HOME)
     _reset_state()
-    _seed_candidate()
     _require_scheduler()
 
-    ok, out = _run(SHIM_NAME)
-    assert ok is True, out
+    ok, silent = _run(SHIM_NAME)                       # empty ledger
+    assert ok is True and scheduler._parse_wake_gate(silent) is False, silent
 
-    job = {
-        "id": "fe00907d72c6",
-        "name": "ambient-sweep",
-        "script": SHIM_NAME,
-        "prompt": "Summarize the ambient candidates.",
-    }
-    prompt = scheduler._build_job_prompt(job, prerun_script=(ok, out))
-    assert prompt, "scheduler produced no prompt"
-    assert "## Script Output" in prompt
-    assert aw_gate.CANDIDATES_BEGIN in prompt and aw_gate.CANDIDATES_END in prompt
+    _seed_candidate()
+    ok, loud = _run(SHIM_NAME)                         # something to report
+    assert ok is True and scheduler._parse_wake_gate(loud) is True, loud
+    _reset_state()
 
-    payload = aw_gate.parse_candidates(prompt)
-    assert payload and payload["candidates"], prompt
-    assert payload["candidates"][0]["channel"] == CHANNEL
-    assert "who owns the deploy key?" in payload["candidates"][0]["excerpt"]
-    # …and the prompt still does not disclose where any of it lives on disk.
-    assert str(DATA_DIR) not in prompt, prompt
+
+def test_the_judge_task_resolves_through_the_real_auxiliary_client():
+    """Open question, now closed for the resolution PATH: the judge's task key
+    must resolve provider/model in-process from the config FILE (not from the
+    ``AUXILIARY_*`` env bridge, which build_subprocess_env strips). Resolution
+    only — no call is made, so this costs nothing."""
+    try:
+        from agent.auxiliary_client import _resolve_task_provider_model, call_llm
+    except Exception:  # pragma: no cover - hermes not importable
+        return
+    assert callable(call_llm)
+    resolved = _resolve_task_provider_model(task=aw_judge.AUX_TASK)
+    assert isinstance(resolved, tuple) and len(resolved) == 5
+    assert resolved[0], "no provider resolved for the ambient judge task"
 
 
 def test_corrupt_config_still_exits_zero_and_gates_off():
