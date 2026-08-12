@@ -6,7 +6,7 @@ Measured against Anthropic's own spec, not against our design doc:
 - https://claude.com/docs/claude-tag/users/proactivity
 
 Verified 2026-08-11 against hermes-agent v0.20.0 source and the live install; arrival-time
-judging re-verified 2026-08-12.
+judging re-verified 2026-08-12; context fidelity (P1) added and scope-audited 2026-08-12.
 **Verdict: the session/threading model matches, and the trigger now matches too. The
 behaviour still does not — we nudge, Claude Tag answers, and closing *that* gap is
 deliberately blocked on human consent (gap 2 below).**
@@ -24,6 +24,8 @@ deliberately blocked on human consent (gap 2 below).**
 | Agent identity — acts under its own account, not the asker | posts as the bot user | live |
 | DM → your own connectors, attributed to you | DMs are passed straight through to Hermes | `aw_recorder.decide` returns `PASS` for `chat_type=="dm"` |
 | Result lands in the asking thread | `aw_post` posts with `thread_ts`, `reply_broadcast=False` | live T7 |
+| A session "reads its own thread and the channel's history" | `aw_context` — `[THIS THREAD]` + `[CHANNEL]` + `[RECENT CHANNEL ACTIVITY]`, one 4400-char ceiling | `aw_context.py` (dark by default) |
+| Other bots' replies filtered out of the window | filtered in `SlackReader._rows`, replaced by `(N bot message(s) omitted)` | `tests/test_context.py` |
 | Spend limits, decline-not-truncate, 75/95 alerts | `aw_budget` | 7 tests |
 | Self-quiet after N ignored | `channel_self_quieted` | tests |
 | In-thread quieting (`!mute`) | `hermes ambient mute` | live T6 |
@@ -110,13 +112,65 @@ Honest scoping of that claim, because "CLOSED" is doing a lot of work in a table
 
 ### P1 — context fidelity
 
-4. **Baseline context.** Spec: every session "reads its own thread and the channel's
-   history, **including pinned items**" and "searches the workspace's content". We hand
-   Hermes the single message; it does not read channel history or pinned items.
-5. **Workspace search.** Claude Tag can find messages by keyword in public channels it
-   is *not* a member of. We cannot see outside watched channels at all.
-6. **50-message thread window.** Spec: a mid-thread mention gets up to 50 messages from
-   the thread root, oldest-first, other bots filtered. Unimplemented and unverified.
+4. **Baseline context — CLOSED 2026-08-12 (code), SHIPS DARK.** Spec: every session
+   "reads its own thread and the channel's history, **including pinned items**".
+   `aw_context.py` adds four labelled sections in a fixed priority order under ONE
+   character ceiling: `[THIS THREAD]` (ledger, backfilled from `conversations.replies`),
+   `[CHANNEL]` (`conversations.info` — name/topic/purpose), `[RECENT CHANNEL ACTIVITY]`
+   (ledger first; `conversations.history` only when the ledger is thin), `[PINNED]`
+   (`pins.list`).
+
+   Honest scoping, because "CLOSED" is doing a lot of work in a heading:
+
+   - **`context_enabled` defaults `false`.** Closed in this repo ≠ live on that machine.
+     A deployed `config.json` without the `context_*` keys produces a **byte-identical**
+     judge prompt, pinned by a golden-hash test.
+   - **Pinned items are PARTIAL and blocked on a human.** `pins:read` is not in the
+     granted bot token — verified: `slack-manifest.json`'s `oauth_config.scopes.bot` has
+     17 entries and pins is not one — so they need an app-manifest change **plus a
+     Reinstall to Workspace**. `context_pins` therefore defaults false, a `missing_scope`
+     reply is cached for the process so it is never retried, the judge is told
+     `context: pinned items unavailable`, and `aw_status.py` prints the remediation.
+     Until an operator does that, this half of the spec line is **not met** — and it
+     says so rather than failing quietly.
+   - **We diverge on the window itself; see gap 6.**
+   - **A live bug fell out of it.** A thread whose root row is absent — root predates the
+     plugin, or `prune()` deleted it while replies continued — was structurally invisible
+     to **both** triggers, forever, because `thread_roots()` selects `WHERE ts=thread_root`.
+     Not "judged with poor context": never nominated. `prune()` no longer deletes a root
+     under an active thread, and such threads are now nominated *provided* the root can be
+     fetched and the root-is-bot loop-safety rung re-established from Slack itself. If it
+     cannot be, the nominee is **dropped, not judged** (`declined-root-unknown`, which
+     consumes no watermark, so the sweep retries).
+   - **Not included, deliberately:** files/attachments (unbounded bytes, classic injection
+     vector, `files:read` *is* granted), real names or Slack user ids (we pseudonymise to
+     `A1`/`A2`; an id in a prompt invites an @-mention, and `sanitize_nudge` refuses every
+     `@`), and custom emoji names outside our own fixed `ACK_REACTIONS` allowlist.
+5. **Workspace search — STILL OPEN, reason upgraded from "we cannot" to "a bot token
+   structurally cannot".** `search.messages` requires `search:read`, which is a **user**
+   scope and is not grantable to a bot token — so this is not closeable with this app at
+   all, no matter what we build. It is also the one addition that would breach the
+   containment perimeter: it ingests text from channels nobody opted into, defeating
+   "watched channels only". Not planned.
+6. **50-message thread window — MIRRORED on two axes, DIVERGED on two.** Mirrored: other
+   bots' replies are **filtered** (replaced by `(N bot message(s) omitted)`), and the
+   **root is included** — that is what the backfill is for. Diverged, deliberately:
+
+   - **Oldest-first → root + oldest + newest.** Their question is "a human just
+     @mentioned me mid-thread, what is this about?", so the origin is the right answer and
+     the session can read more later. Ours is "would an *uninvited* line help, or has this
+     already resolved?" — and that answer lives in the last few messages ("never mind,
+     found it", "thanks Bob"), which oldest-first systematically hides. We also get
+     exactly one shot with no follow-up read, so we cannot spend the window on prologue.
+   - **16 messages, not 50 — a money decision, not a fidelity one.** At a fixed 3000-char
+     thread budget, count and per-message fidelity trade off directly: 50 messages is 60
+     chars each (a fragment), 16 is ~190 (about two sentences, the minimum at which a
+     Slack message still means something). Anthropic can afford 50 because their prompt is
+     cached across a multi-turn session; ours is a one-shot call priced per judgment.
+
+   Worth noting for the table: the spec's "50 messages" sentence is about *a mid-thread
+   mention*, and our mention path is Hermes' own full-toolset session rather than the
+   judge — so that line arguably belongs to a different lane of ours entirely.
 
 ### P2 — lifecycle semantics
 
@@ -176,6 +230,18 @@ Honest scoping of that claim, because "CLOSED" is doing a lot of work in a table
   debounce has to exist anyway to coalesce a burst. **90s is my judgment, not evidence**;
   the shadow soak can answer it empirically by logging how long after each arrival
   judgment a human replied anyway. Lowering it below 30s is refused at config load.
+- **Context: root + oldest + newest, 16 messages, no workspace search.** Three named
+  divergences from the spec's context model, each argued in gap 4/6 above rather than
+  hidden in a constant: we take the two ENDS of a thread instead of its start (our
+  question is "has this resolved?", not "what is this about?"), we take 16 messages
+  instead of 50 (one-shot uncached prompt priced per judgment, so count trades against
+  per-message fidelity), and we do not search the workspace at all (`search:read` is
+  user-scope-only, and reading channels nobody opted into would defeat the watched-channel
+  perimeter).
+- **Pinned items are optional, not baseline.** Claude Tag reads them as a matter of course.
+  For us they cost a manifest change plus a human reinstall, they are the stalest content
+  in the design, and they are the least likely to change "does this thread need help right
+  now" — so they are last in priority, default false, and their absence is reported.
 - **Two triggers, partitioned by age.** Arrival owns
   `[arrival_debounce_seconds, min_age_minutes)`; the sweep owns `[min_age_minutes, ∞)`.
   `load_config` clamps `arrival_max_wait_seconds` strictly below `min_age_minutes * 60` to

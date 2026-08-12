@@ -70,9 +70,34 @@ MAX_EXCERPT_CHARS = 480
 
 # Inbound (judge) profile. Bigger because nothing persists it: the view is a
 # local variable and a request body, never a Hermes message row.
+#
+# THESE TWO DEFAULTS ARE FROZEN ON PURPOSE. The context work (aw_context.py)
+# wants a wider thread window, but a deployed config.json that has never heard
+# of the context keys must produce a BYTE-IDENTICAL judge prompt — so the wider
+# caps are passed in explicitly by the enricher (CTX_THREAD_* below) instead of
+# raising the defaults for everyone.
 JUDGE_MAX_MESSAGES = 12
 JUDGE_MAX_MESSAGE_CHARS = 400
 JUDGE_MAX_VIEW_CHARS = 2400
+
+# -- context profile (aw_context) -------------------------------------------
+# Per-section caps, then ONE ceiling over the assembled block. The ceiling is
+# what makes the worst-case prompt invariant to how much anyone posts: four
+# caps that could sum would not.
+CTX_THREAD_MESSAGES = 16      # root + newest 15 — see build_judge_view
+CTX_THREAD_VIEW_CHARS = 3000  # ~190 chars/message: about two readable sentences
+CTX_TOPIC_CHARS = 200         # channel name + topic + purpose, together
+CTX_TOPIC_FIELD_CHARS = 120   # each of topic/purpose on its own
+CTX_CHANNEL_MSGS = 6
+CTX_CHANNEL_MSG_CHARS = 160
+CTX_CHANNEL_CHARS = 900
+CTX_PIN_ITEMS = 3
+CTX_PIN_CHARS = 150
+CTX_PINS_CHARS = 450
+CTX_TOTAL_CHARS = 4400
+#: A section smaller than this carries no signal, so it is dropped rather than
+#: clipped to a stub when the ceiling is nearly spent.
+CTX_MIN_SECTION_CHARS = 40
 
 # Outbound (nudge) profile — one short sentence, posted publicly.
 NUDGE_MAX_CHARS = 200
@@ -189,7 +214,90 @@ def _relative(seconds: float) -> str:
     return f"+{int(seconds // 86400)}d"
 
 
-def build_judge_view(messages) -> str:
+#: Reaction names we are willing to put in a prompt. A "✅ on the question" is a
+#: strong resolved-signal and it rides along free in the conversations.replies
+#: payload — but custom emoji names are ATTACKER-AUTHORED text, so nothing is
+#: passed through: only names present in this fixed list are emitted, which means
+#: the vocabulary is ours and no attacker string can traverse.
+ACK_REACTIONS = (
+    "white_check_mark", "heavy_check_mark", "ballot_box_with_check",
+    "+1", "eyes", "done",
+)
+
+
+def _acks(row) -> str:
+    """``[ack: name]`` for allowlisted reactions on a row. Never passes text."""
+    if not isinstance(row, dict):
+        return ""
+    names = row.get("acks")
+    if not isinstance(names, (list, tuple, set)):
+        return ""
+    keep = [n for n in ACK_REACTIONS if n in names]
+    return f" [ack: {' '.join(keep)}]" if keep else ""
+
+
+def neutralize_lines(texts, max_chars: int = MAX_MESSAGE_CHARS, limit: int = 0):
+    """Neutralize a sequence of untrusted strings, dropping the empty ones.
+
+    Exists so ``aw_context``'s reader can sanitize a fetched Slack payload at
+    the point of creation with one call, rather than each call site remembering
+    to. Bounded twice: ``limit`` rows, ``max_chars`` each.
+    """
+    out = []
+    for text in list(texts or []):
+        if limit and len(out) >= limit:
+            break
+        body = neutralize(text, max_chars)
+        if body:
+            out.append(body)
+    return out
+
+
+def build_context_block(sections, budget: int = CTX_TOTAL_CHARS) -> str:
+    """Assemble the labelled context sections the judge reads after the thread.
+
+    ``sections`` is an iterable of ``(label, body)`` in PRIORITY order, and
+    that order is the whole cost design: fill the most valuable section first
+    and stop when ``budget`` is gone, so pins are structurally the first thing
+    dropped under pressure and the thread (assembled separately, before this)
+    is structurally never dropped.
+
+    Labels are bracketed because ``{}[]`` are already in ``_FORGERY_CHARS`` and
+    are therefore removed from every payload — so a section header cannot be
+    forged from a channel, the same structural guarantee that protects cron's
+    ``[SILENT]`` marker. The delimiters go on LAST, after every ``<``/``>`` is
+    gone, and the injection check re-runs on the CONCATENATION because a
+    pattern split across a channel topic and a fetched message only becomes
+    visible once the two are joined.
+    """
+    remaining = max(0, int(budget))
+    parts = []
+    for label, body in sections:
+        body = (body or "").strip()
+        if not body:
+            continue
+        header = f"[{label}]\n"
+        room = remaining - len(header) - 1
+        if room < CTX_MIN_SECTION_CHARS:
+            continue  # no room left for a section that would still mean something
+        if len(body) > room:
+            body = body[:room].rstrip() + "..."
+        chunk = header + body
+        parts.append(chunk)
+        remaining -= len(chunk) + 1
+    if not parts:
+        return ""
+    view = "\n".join(parts)
+    if _INJECTION.search(view.replace(REDACTED, "")):
+        view = REDACTED
+    return f"{DELIM_OPEN}\n{view}\n{DELIM_CLOSE}"
+
+
+def build_judge_view(
+    messages,
+    max_messages: int = JUDGE_MAX_MESSAGES,
+    max_view_chars: int = JUDGE_MAX_VIEW_CHARS,
+) -> str:
     """Build the INBOUND view the judge model reads.
 
     ``messages`` may be store rows (dicts with ts/author/is_bot/text) or
@@ -208,9 +316,12 @@ def build_judge_view(messages) -> str:
         return f"{DELIM_OPEN}{EMPTY}{DELIM_CLOSE}"
 
     # Root plus the most recent tail: the two ends of a thread are what a
-    # judgment actually needs.
-    if len(rows) > JUDGE_MAX_MESSAGES:
-        rows = rows[:1] + rows[-(JUDGE_MAX_MESSAGES - 1):]
+    # judgment actually needs. DELIBERATE DIVERGENCE from Claude Tag's
+    # oldest-first 50-message window — see PARITY.md: their question is "what is
+    # this thread about", ours is "has this already resolved", and the answer to
+    # ours lives in the last few messages ("never mind, found it").
+    if len(rows) > max_messages:
+        rows = rows[:1] + rows[-(max_messages - 1):]
 
     base = None
     for row in rows:
@@ -243,11 +354,11 @@ def build_judge_view(messages) -> str:
             text, who, when = row, "A1", ""
         body = neutralize(text, JUDGE_MAX_MESSAGE_CHARS)
         if body:
-            lines.append(f"{who}{when}: {body}")
+            lines.append(f"{who}{when}: {body}{_acks(row)}")
 
     view = "\n".join(lines) if lines else EMPTY
-    if len(view) > JUDGE_MAX_VIEW_CHARS:
-        view = view[:JUDGE_MAX_VIEW_CHARS].rstrip() + "..."
+    if len(view) > max_view_chars:
+        view = view[:max_view_chars].rstrip() + "..."
     # A pattern can be split across two messages and only appear once they
     # are concatenated — same join re-check as the export profile.
     if _INJECTION.search(view.replace(REDACTED, "")):

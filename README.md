@@ -250,6 +250,293 @@ sent (~4 chars/token) and the breadcrumb says `charged ~N ESTIMATED prompt
 tokens`. A provider outage is now a *bounded* outage: the cap trips, the gate
 declines, and the operator hears about it.
 
+## Context fidelity (`context_enabled`, default **false**)
+
+Anthropic's spec says every Claude Tag session *"reads its own thread and the
+channel's history, including pinned items"* and *"searches the workspace's
+content"*. Ours saw **only what our own sqlite ledger recorded since the plugin
+was installed**: a short sanitized excerpt from a handful of messages in one
+thread. It had never seen channel history, never seen a pinned message, and
+could not see anything said before the plugin started running. That was the
+single biggest remaining lever on answer *quality*.
+
+`aw_context.py` adds four labelled sections, in a fixed priority order, under
+**one** character ceiling. Ranked by value-per-byte, which is the only ranking
+that matters when every character is metered in USD:
+
+| # | Section | Where it comes from | Fetched only when |
+|---|---|---|---|
+| 1 | `[THIS THREAD]` | `store.thread_messages()` | the root row is **absent**, or the thread began before we started watching (`root_ts < MIN(ts)` for the channel) |
+| 2 | `[CHANNEL]` — name/topic/purpose, ≤200 chars | — | `conversations.info`, once per channel per 6 h (`context_cache_ttl_seconds`) |
+| 3 | `[RECENT CHANNEL ACTIVITY]` — ≤6 msgs, ≤900 chars | `store.recent_channel_messages()` | `conversations.history` **only** when the ledger yields fewer than `context_channel_messages` rows inside `context_channel_hours` — cold start, post-restart, after quiet hours. Steady state: **zero calls** |
+| 4 | `[PINNED]` — ≤3 items, ≤450 chars | — | `pins.list`, **off by default**, scope-gated (see below) |
+
+**Fill order under budget is the cost design, not a detail.** Sections are
+appended in that order until `context_max_chars` is gone, so pins are
+structurally the first thing dropped under pressure and the thread is
+structurally never dropped. `[CHANNEL]` is first among the fetched sections
+because it is the prior for "should an uninvited bot speak here at all":
+#incident-response and #watercooler produce opposite correct answers to
+identical text, and before this the judge could not tell them apart.
+
+### The rootless-thread fix is a correctness fix, not an enrichment
+
+`store.thread_roots()` selects `WHERE ts=thread_root`. So a thread whose root
+row is missing — because the root predates the plugin, or because 14-day
+`prune()` deleted it while replies continued — was **structurally invisible to
+both triggers, forever**. Not "judged with poor context": never nominated at
+all. That was live on this install and would have recurred every retention
+period.
+
+Two halves, behind **one** boolean:
+
+- `prune()` no longer deletes a `ts = thread_root` row while the thread still
+  has activity inside the retention window. This is the cheap half: it stops the
+  ledger manufacturing new rootless threads, and it drops steady-state
+  `conversations.replies` volume to roughly zero.
+- `find_candidates` admits a rootless thread when the ledger holds ≥1 **human**
+  message in it, tagging `root_missing`. Every other rung still applies. The one
+  rung the ledger cannot answer — `if root["is_bot"]: continue`, the
+  anti-feedback-loop rule, load-bearing because our own nudge is a channel
+  message the recorder sees — is re-established from the **authoritative**
+  source: `conversations.replies` returns the root with `bot_id`/`subtype`, and a
+  bot-authored root drops the nominee before the call. **If the backfill fails
+  the nominee is dropped, not judged** (`declined-root-unknown`, which consumes
+  no watermark, so the sweep retries later).
+
+Admitting rootless threads *without* the ability to fetch the root would be
+fail-open on loop safety. That is why the relaxation and the backfill are one
+switch and not two.
+
+**And rootless threads rank strictly below rooted ones.** This one was found by
+an end-to-end smoke run rather than by design: the sweep nominates one thread per
+channel, ranked by (participants, last activity), and a rootless thread that can
+*never* be verified — the bot is not in the channel, the token is missing — is
+dropped before the judge while its decline consumes no watermark, so it comes back
+every tick. On recency alone it would hold the channel's only slot forever and
+silently suppress every healthy thread: the feature's failure mode would have been
+*ambient going quiet*, which is indistinguishable from a quiet week. So the
+backfill is a recovery mechanism, not a priority — a rootless thread is still
+nominated whenever nothing rooted competes, which is the case it exists for
+(`test_a_rootless_thread_never_crowds_out_a_healthy_candidate`).
+
+### Where it sits in the ladder
+
+```
+prefilter (ZERO network)  →  budget  →  take token  →  enrich (≤2 fetches)  →  judge
+```
+
+Placing enrichment after `TokenBuckets.take` buys the invariant that makes the
+rate-limit argument trivial: **at most one enrichment per judgment**, so Slack
+call volume inherits the token buckets and the USD caps exactly, and **channel
+traffic appears in neither bound**. It costs one thing — a failed root backfill
+burns a bucket token without spending money — which is the conservative
+direction, since the buckets meter attempts by design. Nothing is fetched during
+the deterministic prefilter, and nothing at all is fetched for a candidate the
+spend gate declined (both asserted by test).
+
+Both triggers call the same `enrich_for_judgment(cands, …)`: the sweep inline
+(it is a subprocess, blocking is free), the arrival pump inside
+`asyncio.to_thread` like every other blocking thing in `aw_arrival`.
+`context_total_timeout_seconds` (8 s) bounds the *whole* enrichment, so a hung
+TCP connection cannot park a worker thread or stall cron.
+
+### Two deliberate divergences from the 50-message window
+
+The spec gives a mid-thread mention *"up to 50 messages from the start of the
+thread (the root plus the oldest replies, with other bots' replies filtered
+out)"*. We mirror **bot filtering** and **root inclusion**, and diverge twice:
+
+- **Oldest-first → root + oldest + newest.** Their question is "a human just
+  @mentioned me mid-thread, what is this about?" — the origin, because the newest
+  messages are already in the asker's face and the session can read more later.
+  Ours is "would an *uninvited* line help, or has this already resolved?" — and
+  the answer to that lives in the last few messages ("never mind, found it",
+  "thanks Bob"), which oldest-first would systematically hide. We also get
+  exactly one shot with no follow-up read, so we cannot spend the window on
+  prologue.
+- **16 messages, not 50.** A money decision, not a fidelity one. At a fixed
+  3 000-char thread budget, count and per-message fidelity trade off directly:
+  50 messages is 60 chars each (a fragment), 16 is ~190 (about two sentences —
+  the minimum at which a Slack message still means something). Anthropic can
+  afford 50 because their prompt is cached across a multi-turn session; ours is a
+  one-shot call priced per judgment.
+
+### What is deliberately NOT included
+
+- **Workspace search.** `search.messages` needs `search:read`, which is
+  **user-token-only** — a bot token structurally cannot have it. It is also the
+  one addition that would breach the containment perimeter: it ingests text from
+  channels nobody opted into, defeating "watched channels only". PARITY gap 5
+  stays open with that reason.
+- **Real names / Slack user ids.** We pseudonymise to `A1`/`A2` on purpose: an id
+  in the prompt is an invitation to @-mention someone, and `sanitize_nudge`
+  refuses every `@`, so it would turn a nudge into silence.
+- **Files and attachments** (`files:read` *is* granted) — unbounded bytes and the
+  classic injection vector, for a signal the message text already carries.
+- **Emoji names, except from our own fixed allowlist.** A ✅ on the question is a
+  strong resolved-signal and it rides along free in the `conversations.replies`
+  payload, but custom emoji names are attacker-authored text. Only names in
+  `aw_sanitize.ACK_REACTIONS` are emitted, so the vocabulary is ours and no
+  attacker string can traverse.
+- **Other bots' messages, and `channel_join`/`channel_topic` subtypes**, in
+  fetched context. Anthropic filters bots; for us it is also budget defence —
+  one chatty CI webhook would otherwise eat the whole window. Replaced by
+  `(N bot message(s) omitted)`.
+
+### `pins:read` is not granted — and the omission is reported, not silent
+
+Verified against `%LOCALAPPDATA%\hermes\slack-manifest.json`: the
+`oauth_config.scopes.bot` list has 17 entries and `pins` is not one of them. So
+pins cost an app-manifest change **plus a human Reinstall to Workspace**, and
+they are treated as optional enrichment throughout: `context_pins` defaults
+false, a `missing_scope` reply is cached for the process so it is never retried,
+the judge is told `context: pinned items unavailable`, and `aw_status.py` prints
+`pinned items : unavailable (missing_scope)` with the full remediation. One log
+line, once — a per-judgment warning about a permanent, known configuration gap
+would rotate real failures out of the log.
+
+### What this costs, measured
+
+Every figure below is measured from the code (`len(JUDGE_RULES)` = 1 497,
+`len(CONTEXT_RULES)` = 972, `len(JUDGE_TASK)` = 472, `_CHARS_PER_TOKEN` = 4) at
+the deliberately pessimistic unpriced fallback ($5/$15 per 1M) with
+`judge_max_tokens` 600 — not estimated. As `DECISIONS.md` records, these dollars
+are **modelled** rather than billed on this install (the only configured provider
+uses subscription OAuth), so read them as the throughput governor they are: they
+decide when the gate declines, whether or not money literally moves.
+
+| worst case | prompt chars | prompt tok | prompt $ | completion $ | total |
+|---|---|---|---|---|---|
+| arrival, 1 nominee, TODAY | 4 478 | 1 119 | $0.0056 | $0.0090 | **$0.0146** |
+| arrival, 1 nominee, context, pins off | 7 287 | 1 821 | $0.0091 | $0.0090 | **$0.0181** |
+| arrival, 1 nominee, context, pins on | 7 502 | 1 875 | $0.0094 | $0.0090 | **$0.0184** |
+| sweep, 3 nominees, TODAY | 9 496 | 2 374 | $0.0119 | $0.0090 | **$0.0209** |
+| sweep, 3 nominees, context | 15 977 | 3 994 | $0.0200 | $0.0090 | **$0.0290** |
+
+So **+24 % per arrival judgment, +39 % per sweep tick.** It is not +60 % because
+the 600-token completion dominates and is untouched — which is also the argument
+for spending the increase here rather than on `judge_max_tokens`.
+
+Worst-case nominee arithmetic: thread view 3 000 (+50 delimiters) + channel 200
++ activity 900 + pins 450 = 4 600 > the 4 400 ceiling, so with pins **on** the
+ceiling clips the lowest-priority section to ~206 chars, and with pins **off**
+(the default) the sections sum to 4 150 and the ceiling is slack. Measured
+nominee block: 4 343 chars (pins off) / 4 558 (pins on).
+
+Against the caps on this install (`daily_usd_per_channel` 0.50,
+`daily_usd_global` 1.00, `monthly_usd_global` **5.00**):
+
+- per channel: $0.50 / $0.0181 = **27 judgments/day** (was 34)
+- global daily: $1.00 / $0.0181 = **55/day** (was 68)
+- **the monthly cap binds first, and it already did.** `Budget._ratios` uses a
+  rolling `now − 30 × DAY` window, so $5.00/month is an effective $0.167/day =
+  **~9 judgments/day globally** (was ~11). Context costs this install roughly
+  **1.7 judgments per day of throughput** — that is the honest headline, and it
+  is cheaper than it looks, because the judgments that remain are far less likely
+  to be spent on a thread somebody already answered in-channel.
+- per thread, lifetime: `(1 + judge_max_rejudge) × $0.0181` = **$0.036**
+- rate buckets still cannot outrun the USD caps, which is the property that had
+  to survive.
+
+**A busy channel cannot inflate one judge call, and that is provable rather than
+asserted.** The ceiling is applied to the assembled block *after* every section,
+so the worst-case prompt is invariant to `context_channel_messages`,
+`context_pin_items` and to how much anyone posts. Set
+`context_channel_messages: 500` and the prompt does not grow by one character —
+the extra rows are dropped at assembly. That is the whole reason there is one
+ceiling instead of four caps that could sum
+(`tests/test_context.py::test_a_busy_channel_cannot_inflate_one_judge_call`).
+
+**Slack API budget.** Per judgment: ≤1 `conversations.replies` + ≤1
+`conversations.history`, plus `conversations.info` roughly once per channel per
+6 h. At the global judgment ceiling of ~55/day that is ~110 + a handful ≈
+**0.002 req/s** against Tier 3's ~50/min — about four orders of magnitude of
+headroom. The pump is serial with at most one judgment in flight process-wide, so
+at most two Slack sockets exist at any instant. A 429 is therefore a symptom of
+something else on the token: one bounded `Retry-After` retry, then degrade.
+
+### Containment: what changed, and what did not
+
+Two things genuinely get worse, and neither is a disk or a tool exposure.
+
+1. **The volume of attacker-controllable text per prompt roughly doubles**
+   (~2 500 → ~4 550 chars per nominee). The mitigations are unchanged and still
+   the right ones: the judge is **tool-less**, its output is one ≤200-char line
+   through `sanitize_nudge`, and structural forgery is impossible because the
+   forging characters do not survive `_clean`.
+2. **A new cross-thread influence channel exists.** Before this, a hostile
+   message could only try to influence the verdict on *its own* thread. With
+   `[RECENT CHANNEL ACTIVITY]`, a message posted anywhere in a watched channel
+   can attempt to influence a verdict on a thread it is not in. Bounded to ≤6
+   messages × 160 chars from watched channels only, and the judge is told
+   explicitly that a verdict must be about the labelled thread only.
+
+What does **not** change:
+
+- **L1 is enforced at the point of creation.** `SlackReader` is the only code
+  that touches a Slack response body and it does not return raw text: every
+  method maps its rows through `aw_sanitize.neutralize` with the section's cap
+  before returning. There is no code path on which a raw fetched string reaches a
+  variable a caller can read, so a future caller cannot forget. `build_context_block`
+  then re-runs the `_INJECTION` check on the **concatenation** (a pattern split
+  across adjacent lines only becomes visible once joined) and attaches the
+  delimiters last. Section labels are bracketed, and `{}[]` are already in
+  `_FORGERY_CHARS`, so `[PINNED]` is **structurally unforgeable from a channel** —
+  the same argument that protects cron's `[SILENT]`.
+- **Nothing new is written to disk, and the proof is architectural.**
+  `ContextCache` is a process-local dict, deliberately *not* a `flags` row:
+  persisting a topic or a pin would create a new permanent copy of untrusted
+  text, which is the exact category the 2026-08-11 incident came from. So the
+  count of new persisted bytes is **zero**. A test snapshots the data directory
+  before and after a fully-enriched live judgment and asserts only `ambient.db`
+  changed and that no fetched string appears in any file.
+- **`judgments.excerpt` stays thread-only.** It is the one place the sweep
+  deliberately writes untrusted text to `ambient.db`; widening it would put text
+  from unrelated conversations into a thread's audit row. Enforced by test.
+- **L2 is untouched.** The gate still emits only channel id, thread ts, kind,
+  verdict, confidence, spend and the model-authored nudge. `candidates.json`
+  remains deleted and `purge_untrusted_artifacts()` still runs first on every
+  tick. A test asserts no section marker (`[PINNED]`, `[CHANNEL]`, …) can reach
+  stdout — a good canary precisely because those markers cannot be produced by
+  anything except our own assembler.
+- **L3 is unchanged and has a dedicated regression.** No new files means no new
+  markers; the jail already covers `plugin-data`, `ambient_watch`, `ambient.db`,
+  `arrival.log` for every tool name with no principal exemption. The new test
+  asserts it still blocks **after a fully-enriched judgment has run**, including
+  for a tool name that does not exist yet.
+- **The bigger prompt is still not a permanent copy in Hermes' FTS-indexed
+  `state.db`.** The judge calls `auxiliary_client.call_llm` / `async_call_llm`
+  directly, one layer below any agent session; the only persistence on that path
+  is `record_auxiliary_usage` (token counts, a model name, a dollar figure — no
+  prompt text), and it no-ops entirely outside an agent turn. The prompt can
+  double in size without adding one FTS-indexed byte.
+
+### Mutation-verified
+
+Every load-bearing assertion was checked by breaking the code and confirming a
+test fails:
+
+| Mutation | Test that caught it |
+|---|---|
+| remove the `CTX_TOTAL_CHARS` clip in `build_context_block` | `test_the_total_character_ceiling_actually_truncates` |
+| remove `neutralize()` from a fetched channel topic | `test_each_fetched_field_is_sanitized_on_its_own[topic]` |
+| make a Slack failure raise instead of degrading | `test_a_raising_transport_is_still_only_a_degradation` |
+| remove the enrichment call at the **sweep** site | `test_the_sweep_drops_a_rootless_thread_it_cannot_verify` |
+| remove the enrichment call at the **arrival** site | `test_the_arrival_path_drops_an_unverifiable_rootless_thread` |
+| remove the bot-root check | `test_the_backfilled_root_re_establishes_the_loop_safety_rule` |
+| move enrichment **above** the spend gate | `test_a_declined_candidate_costs_no_slack_call` |
+| judge a rootless thread whose backfill failed | `test_a_rootless_thread_whose_backfill_fails_is_dropped_not_judged` |
+| revert the `prune()` root-retention fix | `test_prune_stops_manufacturing_rootless_threads` |
+| let a rootless thread outrank a rooted one | `test_a_rootless_thread_never_crowds_out_a_healthy_candidate` |
+
+The per-field sanitizer mutation is worth singling out: it **survived** the first
+attempt, because a probe that is instruction-shaped gets the whole block redacted
+by the join-level check, so the test passed with `neutralize` deleted. The test
+was rewritten with a *benign but structure-forging* probe, which only per-field
+sanitization can strip. Defence in depth is good; a test that cannot tell which
+layer fired is not.
+
 ## Containment: untrusted channel text
 
 Every excerpt this plugin produces is **verbatim text an attacker chose**. Any
@@ -533,6 +820,57 @@ learn about the new trigger is whatever it does in production.
 Rollback at any point: set `arrival_enabled: false` and restart the gateway. The
 sweep keeps working throughout; nothing in the ledger needs undoing.
 
+### Turning ON context fidelity (separate, later, in this order)
+
+Nothing below is run for you. Steps (a)–(b) are the "prove it changed nothing"
+step, and they matter more here than for arrival mode because this change costs
+money on **every** judgment rather than changing when judgments happen.
+
+a. **Sync the plugin dir and restart the gateway with the new keys ABSENT**, then
+   confirm from the Hermes log that nothing changed. `_clamp_context` logs at
+   `debug` while `context_enabled` is false precisely so that a dark deploy is
+   silent — a printed clamp warning would mean something is wrong.
+   ```
+   robocopy "E:\GIT\ClaudeTag\ambient-watch" "%LOCALAPPDATA%\hermes\plugins\ambient-watch" /MIR /XD __pycache__
+   ```
+   The gate is imported fresh by the cron shim each tick, so the sweep picks the
+   new code up on its own; the gateway needs the restart for `register()`.
+
+b. **Enable it, pins off, and watch for a day.**
+   ```json
+   { "context_enabled": true, "context_pins": false }
+   ```
+   `config.json` is read per sweep and at `register()`, so the sweep picks this up
+   on the next tick and the arrival path at the next gateway restart. Then watch
+   `python aw_status.py` → **CONTEXT FIDELITY**: `fetches`, `failures`,
+   `rate_limited`, `dropped`, and what the last judgment actually saw (chars,
+   message counts, sections). Expect `fetches` to be **small** — the ledger
+   answers most of it — and `dropped` to be non-zero only if the bot is not in a
+   watched channel.
+
+c. **Only if you want pinned items** (they are the lowest-value section, and the
+   stalest):
+   1. [api.slack.com/apps](https://api.slack.com/apps) → your app → **OAuth &
+      Permissions** → add the **`pins:read` bot scope**. Do **not** hand-edit
+      `%LOCALAPPDATA%\hermes\slack-manifest.json`: `hermes slack manifest --write`
+      regenerates it and would silently drop the edit.
+   2. **Reinstall to Workspace** (a scope change requires it).
+   3. Re-copy the bot token from **OAuth & Permissions** into
+      `%LOCALAPPDATA%\hermes\.env`.
+   4. Verify with `auth.test` that the `x-oauth-scopes` response header now lists
+      `pins:read` — 18 scopes, not 17.
+   5. Restart the gateway, then set `"context_pins": true`.
+
+d. **Decide about `monthly_usd_global`.** It is **5.00** on this install and it is
+   the binding cap: a rolling 30-day window makes that an effective $0.167/day,
+   i.e. ~9 judgments/day globally with context on (was ~11). Raise it to 10.00 or
+   accept the lower throughput — but know which one you chose.
+
+Rollback: set `context_enabled: false`. The sweep picks it up on the next tick;
+the gateway needs a restart for the arrival path. Nothing in the ledger needs
+undoing, and the two new `flags` rows (`context_counters`, `context_last`) hold
+numbers only.
+
 ## Config surface
 
 | Key | Default | Meaning |
@@ -548,6 +886,18 @@ sweep keeps working throughout; nothing in the ledger needs undoing.
 | `arrival_burst` | 2 | bucket capacity, both scopes |
 | `arrival_max_pending` | 200 | cap on the in-memory pending map; over cap the **new** entry is dropped and counted (the sweep is the backstop, so the loss is latency) |
 | `arrival_pump_interval_seconds` | 5 | pump wake interval; worst added latency is debounce + this |
+| `context_enabled` | **false** | ships dark. `false` ⇒ nothing is fetched, the judge prompt is **byte-identical** to the sweep-only build, and a deployed `config.json` without any `context_*` key behaves exactly as before. **This is the rollback: one boolean.** |
+| `context_thread_backfill` | true | `conversations.replies` when the ledger has no root row (or the thread predates the ledger). Also gates admitting rootless threads at all — one switch, because admitting them without being able to fetch the root would be fail-open on the root-is-bot rule |
+| `context_topic` | true | `[CHANNEL]` — name/topic/purpose, ≤200 chars, one `conversations.info` per channel per TTL |
+| `context_channel_history` | true | `[RECENT CHANNEL ACTIVITY]`, ledger-first |
+| `context_channel_messages` | 6 | messages in that section; clamped to ≤`CTX_CHANNEL_MSGS` (6). Raising it cannot grow the prompt — the ceiling is applied after assembly |
+| `context_channel_hours` | 6 | how far back that window looks |
+| `context_pins` | **false** | `[PINNED]`. Needs the `pins:read` bot scope, which is **not granted** on this install: an app-manifest change plus a human reinstall. Absent scope ⇒ section skipped, reported once |
+| `context_pin_items` | 3 | pinned items, ≤450 chars total |
+| `context_max_chars` | 4400 | **THE ceiling**, over all four sections together, applied *after* assembly. Clamped to ≤6000 so a config typo cannot inflate every prompt |
+| `context_fetch_timeout_seconds` | 4 | per Slack call |
+| `context_total_timeout_seconds` | 8 | for the **whole** enrichment, so a hung socket cannot park a worker thread or stall cron |
+| `context_cache_ttl_seconds` | 21600 | 6 h, for channel identity/pins. Process-local memory, **never persisted** |
 | `judge_confidence_threshold` | 0.7 | below this the nudge is withheld |
 | `judge_max_rejudge` | 1 | extra judgments allowed after new human activity |
 | `judge_max_tokens` / `judge_timeout_seconds` | 600 / 30 | hard bounds on the call |

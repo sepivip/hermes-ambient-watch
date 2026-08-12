@@ -209,6 +209,21 @@ def register(ctx):
             )
             arrival = None
 
+    # CONTEXT FIDELITY — also ships dark. One line only when it is ON: the
+    # acceptance test for a dark deploy is that the log says nothing changed, so
+    # a disabled feature must not announce itself on every gateway start.
+    if getattr(cfg, "context_enabled", False):
+        logger.info(
+            "ambient-watch: context fidelity ENABLED (thread backfill=%s, "
+            "channel identity=%s, channel history=%s (%d msg/%dh), pins=%s, "
+            "ceiling=%d chars/nominee) — nothing is fetched during the "
+            "prefilter and at most one enrichment happens per judgment, so "
+            "Slack call volume inherits the spend caps and rate buckets",
+            cfg.context_thread_backfill, cfg.context_topic,
+            cfg.context_channel_history, cfg.context_channel_messages,
+            cfg.context_channel_hours, cfg.context_pins, cfg.context_max_chars,
+        )
+
     def on_pre_gateway_dispatch(event=None, **kwargs):
         if event is None:
             return None

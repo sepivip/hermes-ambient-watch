@@ -235,6 +235,92 @@ def arrival_section(db, cfg):
         print("  (no arrival.log yet -- nothing has been judged on arrival)")
 
 
+def context_section(db, cfg):
+    """Context fidelity: the effective settings, and what the LAST judgment
+    actually saw — in COUNTS AND CHARACTERS, never the text.
+
+    The fetched strings never reach this script at all: nothing persists them
+    (``ContextCache`` is a process-local dict by design), so there is nothing
+    here to sanitize. If that ever changes, whatever is added must go through
+    ``safe_text`` like every other body — the same rule the RECORDED MESSAGES
+    section follows.
+    """
+    enabled = bool(cfg.get("context_enabled", False))
+    print("\nCONTEXT FIDELITY (what the judge is allowed to see)")
+    print(f"  context_enabled   : {'ON' if enabled else 'off (ledger thread only)'}")
+    print(f"  thread backfill   : "
+          f"{'on' if cfg.get('context_thread_backfill', True) else 'off'}"
+          "   (conversations.replies when the ledger has no root row --")
+    print("                      such a thread is otherwise invisible to BOTH triggers)")
+    print(f"  channel identity  : "
+          f"{'on' if cfg.get('context_topic', True) else 'off'}"
+          "   (conversations.info: name/topic/purpose, <=200 chars, cached "
+          f"{int(cfg.get('context_cache_ttl_seconds', 21600)) // 3600}h)")
+    print(f"  channel activity  : "
+          f"{'on' if cfg.get('context_channel_history', True) else 'off'}"
+          f"   ({cfg.get('context_channel_messages', 6)} msg / "
+          f"{cfg.get('context_channel_hours', 6)}h window, LEDGER first --")
+    print("                      conversations.history only when the ledger is thin)")
+    pins_flag = None
+    try:
+        row = db.execute(
+            "SELECT value FROM flags WHERE key='context_pins_scope'"
+        ).fetchone()
+        pins_flag = row["value"] if row else None
+    except sqlite3.OperationalError:
+        pins_flag = None
+    if not cfg.get("context_pins", False):
+        print("  pinned items      : off (default) -- pins:read is NOT in the bot")
+        print("                      token's scopes on this install, so turning it on")
+        print("                      needs an app-manifest change plus a human")
+        print("                      Reinstall to Workspace first.")
+    elif pins_flag:
+        print(f"  pinned items      : unavailable ({pins_flag})")
+        print("                      REMEDIATION: api.slack.com/apps -> your app ->")
+        print("                      OAuth & Permissions -> add the pins:read BOT")
+        print("                      scope -> Reinstall to Workspace -> re-copy the")
+        print("                      bot token into %LOCALAPPDATA%\\hermes\\.env ->")
+        print("                      restart the gateway. Do NOT hand-edit")
+        print("                      slack-manifest.json: `hermes slack manifest")
+        print("                      --write` regenerates it and drops the edit.")
+    else:
+        print(f"  pinned items      : on ({cfg.get('context_pin_items', 3)} item(s) max)")
+    print(f"  ceiling           : {cfg.get('context_max_chars', 4400)} chars per "
+          "nominee, over ALL sections, applied")
+    print("                      AFTER assembly -- so a busy channel cannot inflate")
+    print("                      one judge call by a single character.")
+    print(f"  fetch timeouts    : {cfg.get('context_fetch_timeout_seconds', 4)}s per "
+          f"call, {cfg.get('context_total_timeout_seconds', 8)}s for the whole "
+          "enrichment")
+
+    counters = _json_flag(db, "context_counters")
+    if counters:
+        print("  totals            : " + "  ".join(
+            f"{k}={int(counters.get(k) or 0)}"
+            for k in ("judgments", "fetches", "failures", "rate_limited",
+                      "budget_skipped", "cache_hits", "cache_misses", "dropped")
+        ))
+        if counters.get("updated_at"):
+            print(f"  last enrichment   : {ago(counters['updated_at'])}")
+    elif enabled:
+        print("  totals            : (nothing enriched yet)")
+
+    last = _json_flag(db, "context_last")
+    if last:
+        print("  last judgment saw : "
+              f"{int(last.get('chars') or 0)} chars total "
+              f"({int(last.get('context_chars') or 0)} of them context), "
+              f"{int(last.get('thread_msgs') or 0)} thread message(s), "
+              f"{int(last.get('fetches') or 0)} Slack call(s)")
+        print(f"                      sections: "
+              f"{', '.join(last.get('sections') or ['(none)'])}")
+        if last.get("notes"):
+            print(f"                      degraded: {', '.join(last['notes'])}")
+        print("                      (counts only -- no fetched text is stored"
+              " anywhere,")
+        print("                      which is why there is none to print here)")
+
+
 def judgment_section(db):
     print("\nJUDGE OUTCOMES (the model decides; a '?' regex no longer does)")
     try:
@@ -288,6 +374,7 @@ def status():
 
     budget_section(db, cfg)
     arrival_section(db, cfg)
+    context_section(db, cfg)
     judgment_section(db)
 
     print("\nRECORDED MESSAGES (L1-sanitized: inert, capped, injections redacted)")
@@ -366,7 +453,8 @@ def main() -> int:
                 # (a reset must never silently re-arm a halted ambient mode).
                 db.execute(
                     "DELETE FROM flags WHERE key IN"
-                    " ('arrival_counters','arrival_reported')"
+                    " ('arrival_counters','arrival_reported','context_counters',"
+                    "  'context_last','context_pins_scope')"
                 )
             except sqlite3.OperationalError:
                 pass

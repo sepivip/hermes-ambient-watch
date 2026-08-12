@@ -181,6 +181,129 @@ class AmbientStore:
             row = cur.fetchone()
             return dict(row) if row else None
 
+    # -- context fidelity (aw_context) ------------------------------------
+    # Both queries below are deliberately NARROW. ``messages_in_channel()``
+    # would answer them and must not be used: it returns every row in the
+    # channel, text included, while holding this connection's single RLock —
+    # the same lock the recorder needs on the GATEWAY LOOP THREAD. Same
+    # reasoning that already produced ``thread_root()`` next to
+    # ``thread_roots()``.
+    #
+    # ORDER BY ts, not CAST(ts AS REAL): the cast defeats the (channel, ts)
+    # primary-key index. Slack ts strings are fixed-width zero-padded, so
+    # lexicographic order equals numeric order until the epoch grows an 11th
+    # digit (year 2286). ``since`` is formatted to the same width for the same
+    # reason — and because comparing a TEXT column against a bare float in
+    # SQLite is always true (NULL < numbers < TEXT), i.e. a silently absent
+    # filter.
+    def recent_channel_messages(self, channel, limit, since=None):
+        """The newest ``limit`` rows in a channel, newest LAST. Bounded."""
+        limit = max(0, int(limit))
+        if not limit:
+            return []
+        sql = "SELECT * FROM messages WHERE channel=?"
+        args = [channel]
+        if since is not None:
+            sql += " AND ts>=?"
+            args.append(f"{float(since):.6f}")
+        sql += " ORDER BY ts DESC LIMIT ?"
+        args.append(limit)
+        with self._lock:
+            rows = [dict(r) for r in self._db.execute(sql, args).fetchall()]
+        rows.reverse()
+        return rows
+
+    def explain_recent_channel_messages(self, channel) -> str:
+        """The query plan for the above. Exists so a test can PROVE the index
+        is used rather than asserting it in a comment."""
+        with self._lock:
+            rows = self._db.execute(
+                "EXPLAIN QUERY PLAN SELECT * FROM messages WHERE channel=?"
+                " AND ts>=? ORDER BY ts DESC LIMIT ?",
+                (channel, "0", 1),
+            ).fetchall()
+        return " | ".join(str(r["detail"]) for r in rows)
+
+    def channel_first_ts(self, channel):
+        """"When did we start watching this channel", derived not stored.
+
+        MIN(ts) is the watermark that tells the enricher a thread began before
+        the ledger existed and therefore needs a ``conversations.replies``
+        backfill. Derived, so it needs no migration and cannot drift.
+        """
+        with self._lock:
+            row = self._db.execute(
+                "SELECT MIN(ts) m FROM messages WHERE channel=?", (channel,)
+            ).fetchone()
+        try:
+            return float(row["m"])
+        except (TypeError, ValueError):
+            return None
+
+    def orphan_threads(self, channel):
+        """Threads with at least one HUMAN message and NO root row.
+
+        The structural blind spot this closes: ``thread_roots()`` selects
+        ``WHERE ts=thread_root``, so a thread whose root predates the plugin —
+        or whose root was deleted by retention while replies continued — was
+        never nominated by either trigger. Synthetic root rows are returned so
+        the shared eligibility ladder can run unchanged; ``is_bot`` is 0 because
+        it is UNKNOWN here, and the enricher re-establishes the real answer from
+        ``conversations.replies`` before anything can be judged.
+        """
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT thread_root, MIN(ts) first_ts FROM messages m"
+                " WHERE channel=? AND NOT EXISTS ("
+                "   SELECT 1 FROM messages r WHERE r.channel=m.channel"
+                "   AND r.ts=m.thread_root)"
+                " GROUP BY thread_root"
+                " HAVING SUM(CASE WHEN is_bot=0 THEN 1 ELSE 0 END) > 0"
+                " ORDER BY thread_root",
+                (channel,),
+            ).fetchall()
+        return [
+            {
+                "channel": channel,
+                "ts": r["thread_root"],
+                "thread_root": r["thread_root"],
+                "author": None,
+                "is_bot": 0,
+                "is_mention": 0,
+                "text": "",
+                "created_at": 0.0,
+                "root_missing": True,
+            }
+            for r in rows
+        ]
+
+    def orphan_thread(self, channel, root):
+        """The narrow form of ``orphan_threads`` — one thread, by key.
+
+        Narrow SQL rather than a filtered scan of ``orphan_threads``, for the
+        same reason ``thread_root`` exists: the arrival path considers exactly
+        one thread and must not walk the channel while holding this lock.
+        """
+        with self._lock:
+            row = self._db.execute(
+                "SELECT COUNT(*) n,"
+                " SUM(CASE WHEN is_bot=0 THEN 1 ELSE 0 END) humans"
+                " FROM messages WHERE channel=? AND thread_root=?",
+                (channel, root),
+            ).fetchone()
+            if not row or not row["n"] or not (row["humans"] or 0):
+                return None
+            has_root = self._db.execute(
+                "SELECT 1 FROM messages WHERE channel=? AND ts=?", (channel, root)
+            ).fetchone()
+        if has_root:
+            return None
+        return {
+            "channel": channel, "ts": root, "thread_root": root, "author": None,
+            "is_bot": 0, "is_mention": 0, "text": "", "created_at": 0.0,
+            "root_missing": True,
+        }
+
     def thread_messages(self, channel, root):
         with self._lock:
             cur = self._db.execute(
@@ -477,8 +600,19 @@ class AmbientStore:
         """Delete expired message bodies and stale bookkeeping rows."""
         cutoff = now - retention_days * 86400
         with self._lock, self._db:
+            # KEEP A ROOT WHOSE THREAD IS STILL ALIVE. Deleting the ts=thread_root
+            # row while replies continue inside the window used to MANUFACTURE a
+            # rootless thread every retention period: `thread_roots()` selects
+            # WHERE ts=thread_root, so the thread became invisible to both
+            # triggers forever. This is the cheap half of the backfill fix, and it
+            # is what keeps steady-state conversations.replies volume near zero.
             removed = self._db.execute(
-                "DELETE FROM messages WHERE CAST(ts AS REAL) < ?", (cutoff,)
+                "DELETE FROM messages WHERE CAST(ts AS REAL) < ?"
+                " AND NOT (ts = thread_root AND EXISTS ("
+                "   SELECT 1 FROM messages m2 WHERE m2.channel = messages.channel"
+                "   AND m2.thread_root = messages.thread_root"
+                "   AND CAST(m2.ts AS REAL) >= ?))",
+                (cutoff, cutoff),
             ).rowcount
             # Judgments of threads whose messages are gone carry no signal,
             # but keep them while the thread is still in the ledger: the row
@@ -580,6 +714,18 @@ class AmbientStore:
     def set_arrival_reported(self, counters: dict):
         self.set_flag(self._ARRIVAL_REPORTED_KEY, json.dumps(dict(counters or {})))
 
+    #: Cumulative context-fidelity counters (fetches, failures, 429s, cache
+    #: hits). Numbers only, by construction — same rule as the arrival
+    #: counters: this is an ops surface, so it must be structurally incapable
+    #: of carrying channel text.
+    _CONTEXT_COUNTER_KEY = "context_counters"
+
+    def context_counters(self) -> dict:
+        return self._json_flag(self._CONTEXT_COUNTER_KEY)
+
+    def bump_context_counters(self, now=None, **deltas) -> dict:
+        return self._bump_json_counters(self._CONTEXT_COUNTER_KEY, now, deltas)
+
     def bump_arrival_counters(self, now=None, **deltas) -> dict:
         """Read-modify-write the arrival counters. Never raises.
 
@@ -588,9 +734,12 @@ class AmbientStore:
         off by one, which is why it is not worth a cross-process lock on the
         gateway's event loop.
         """
+        return self._bump_json_counters(self._ARRIVAL_COUNTER_KEY, now, deltas)
+
+    def _bump_json_counters(self, key: str, now, deltas: dict) -> dict:
         with self._lock, self._db:
             cur = self._db.execute(
-                "SELECT value FROM flags WHERE key=?", (self._ARRIVAL_COUNTER_KEY,)
+                "SELECT value FROM flags WHERE key=?", (key,)
             )
             row = cur.fetchone()
             data = {}
@@ -600,14 +749,14 @@ class AmbientStore:
                     data = parsed if isinstance(parsed, dict) else {}
                 except ValueError:
                     data = {}
-            for key, delta in deltas.items():
+            for name, delta in deltas.items():
                 try:
-                    data[key] = (data.get(key) or 0) + delta
+                    data[name] = (data.get(name) or 0) + delta
                 except TypeError:
-                    data[key] = delta
+                    data[name] = delta
             data["updated_at"] = time.time() if now is None else float(now)
             self._db.execute(
                 "INSERT OR REPLACE INTO flags (key, value) VALUES (?,?)",
-                (self._ARRIVAL_COUNTER_KEY, json.dumps(data)),
+                (key, json.dumps(data)),
             )
             return dict(data)

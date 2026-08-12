@@ -81,9 +81,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 try:  # real loader: package-relative
-    from . import aw_detectors
+    from . import aw_context, aw_detectors
     from .aw_recorder import arrival_key
 except ImportError:  # cron shim / bare script: flat import
+    import aw_context
     import aw_detectors
     from aw_recorder import arrival_key
 
@@ -329,13 +330,19 @@ class ArrivalRuntime:
     """
 
     def __init__(self, cfg, store, *, judge_fn=None, transport=None,
-                 clock=None, wall_clock=None):
+                 reader=None, clock=None, wall_clock=None):
         self.cfg = cfg
         self.store = store
         self.debouncer = Debouncer.from_cfg(cfg)
         self.buckets = TokenBuckets.from_cfg(cfg)
         self._judge_fn = judge_fn
         self._transport = transport
+        # Context fidelity. The cache and the reader live for the PROCESS: the
+        # gateway is long-lived, so one conversations.info per channel per TTL
+        # (6h) is the whole channel-identity cost. Both are process-local
+        # memory; nothing here is ever persisted.
+        self._cache = aw_context.ContextCache()
+        self._reader = reader
         self._clock = clock or time.monotonic
         self._wall = wall_clock or time.time
         self._task = None          # STRONG ref: create_task holds only a weak one
@@ -586,6 +593,32 @@ class ArrivalRuntime:
             self._bump(throttled=1)
             return "throttled"
 
+        # 13.5. CONTEXT FIDELITY, off the loop thread like every other blocking
+        #       thing here (<=2 Slack GETs plus two narrow ledger reads, bounded
+        #       by context_total_timeout_seconds). It sits BELOW buckets.take so
+        #       at most one enrichment exists per judgment — that is what makes
+        #       Slack call volume inherit the buckets and the USD caps rather
+        #       than following channel traffic. A rootless thread whose root
+        #       cannot be verified is dropped here: without the root we cannot
+        #       answer "is this thread bot-authored?", and guessing would be
+        #       fail-open on the anti-feedback-loop rule.
+        if getattr(cfg, "context_enabled", False):
+            dropped = await asyncio.to_thread(
+                self._enrich, cand, wall
+            )
+            if dropped:
+                await asyncio.to_thread(
+                    store.record_decline, channel, cand.thread_ts, dropped,
+                    excerpt=cand.excerpt, now=wall,
+                )
+                self.stats["declined"] += 1
+                self._bump(declined=1)
+                self._log(
+                    f"DROPPED {channel}/{cand.thread_ts} [{cand.kind}] -- "
+                    f"{dropped} (not judged, not posted)"
+                )
+                return dropped
+
         # 14. the call. One nominee, no tools, JSON out.
         self.stats["judged"] += 1
         result = await self._judge([cand])
@@ -653,6 +686,23 @@ class ArrivalRuntime:
             # 19. deliver, or shadow-mark.
             outcome = await self._deliver(cand, verdict, wall, aw_post)
         return outcome
+
+    def _enrich(self, cand, wall) -> str:
+        """``enrich_for_judgment`` for one nominee, on a worker thread.
+
+        Returns the drop reason, or "" to judge it. Never raises: a context
+        failure must be "judge with less context", never a lost judgment.
+        """
+        if self._reader is None:
+            self._reader = aw_context.SlackReader.from_cfg(self.cfg)
+        try:
+            result = aw_context.enrich_for_judgment(
+                [cand], self.cfg, self.store, self._cache, self._reader, wall
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("ambient-watch: arrival enrichment failed", exc_info=True)
+            return ""
+        return result.dropped[0][1] if result.dropped else ""
 
     async def _judge(self, nominees):
         """One bounded structured call. No tools, JSON out, text in one thread.

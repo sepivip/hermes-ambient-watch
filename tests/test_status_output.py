@@ -186,3 +186,70 @@ def test_status_still_opens_a_ledger_written_by_the_real_store(seeded_home):
     db = sqlite3.connect(str(status.DB_PATH))
     assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 2
     db.close()
+
+
+def test_the_context_section_reports_counts_and_never_fetched_text(
+    seeded_home, capsys
+):
+    """The ops surface for P1. It shows what the last judgment SAW — characters,
+    message counts, Slack call counts, section names — and no channel text,
+    because none is persisted anywhere for it to read."""
+    data = seeded_home / "plugin-data" / "ambient_watch"
+    cfg = json.loads((data / "config.json").read_text(encoding="utf-8"))
+    cfg.update({"context_enabled": True, "context_max_chars": 4400})
+    (data / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+    store = AmbientStore(data / "ambient.db")
+    store.bump_context_counters(judgments=3, fetches=4, failures=1,
+                               rate_limited=1, cache_hits=2, cache_misses=2)
+    store.set_flag("context_last", json.dumps({
+        "chars": 4100, "context_chars": 1100, "thread_msgs": 7,
+        "sections": ["CHANNEL", "RECENT CHANNEL ACTIVITY"],
+        "notes": ["pinned items unavailable"], "fetches": 2, "at": T0,
+    }))
+    store.close()
+
+    status = _load_status(seeded_home)
+    status.status()
+    out = capsys.readouterr().out
+
+    assert "CONTEXT FIDELITY" in out
+    assert "context_enabled   : ON" in out
+    assert "judgments=3" in out and "fetches=4" in out and "rate_limited=1" in out
+    assert "4100 chars total" in out and "1100 of them context" in out
+    assert "7 thread message(s)" in out and "2 Slack call(s)" in out
+    assert "CHANNEL, RECENT CHANNEL ACTIVITY" in out
+    assert "pinned items unavailable" in out
+    assert "4400 chars per nominee" in out
+
+
+def test_the_context_section_prints_the_pins_remediation_when_the_scope_is_missing(
+    seeded_home, capsys
+):
+    """5 of the brief: a missing ``pins:read`` is skipped cleanly AND reported —
+    with the exact operator steps, including the warning not to hand-edit the
+    generated manifest."""
+    data = seeded_home / "plugin-data" / "ambient_watch"
+    cfg = json.loads((data / "config.json").read_text(encoding="utf-8"))
+    cfg.update({"context_enabled": True, "context_pins": True})
+    (data / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+    store = AmbientStore(data / "ambient.db")
+    store.set_flag("context_pins_scope", "missing_scope")
+    store.close()
+
+    status = _load_status(seeded_home)
+    status.status()
+    out = capsys.readouterr().out
+
+    assert "pinned items      : unavailable (missing_scope)" in out
+    assert "pins:read" in out
+    assert "Reinstall to Workspace" in out
+    assert "slack-manifest.json" in out
+
+
+def test_the_context_section_is_quiet_and_honest_while_dark(seeded_home, capsys):
+    status = _load_status(seeded_home)
+    status.status()
+    out = capsys.readouterr().out
+    assert "context_enabled   : off (ledger thread only)" in out
+    assert "pins:read is NOT in the bot" in out

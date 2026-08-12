@@ -53,6 +53,17 @@ class Candidate:
     idle_minutes: int = 0
     last_activity: float = 0.0
     messages: list = field(default_factory=list)
+    # -- context fidelity (aw_context; empty unless context_enabled) -------
+    #: The labelled [CHANNEL]/[RECENT CHANNEL ACTIVITY]/[PINNED] sections, sealed
+    #: in the same unforgeable delimiters as the thread view. In-memory only.
+    context_block: str = ""
+    #: True when the ledger holds no root row for this thread. Such a thread was
+    #: invisible to BOTH triggers; it is admitted only when the enricher can
+    #: fetch the root and re-establish the root-is-bot rung from Slack itself.
+    root_missing: bool = False
+    #: Our own fixed vocabulary ("channel history unavailable", …) — told to the
+    #: judge so a missing section reads as absent rather than as "quiet".
+    context_note: str = ""
 
 
 def _local_minutes(now: float, tz_name: str) -> int:
@@ -81,6 +92,22 @@ def _in_quiet_hours(cfg, now: float) -> bool:
     return lm >= start or lm < end  # window wraps midnight
 
 
+def _context_backfill(cfg) -> bool:
+    """True when a thread with NO root row may be nominated.
+
+    ONE boolean over two halves, deliberately. Admitting a rootless thread
+    without the ability to fetch its root would be fail-OPEN on the
+    ``root["is_bot"]`` anti-feedback-loop rule — our own posted nudge is a
+    channel message the recorder sees. So the relaxation is gated on the same
+    switch that enables the ``conversations.replies`` backfill which restores
+    that rung from the authoritative source (see aw_context).
+    """
+    return bool(
+        getattr(cfg, "context_enabled", False)
+        and getattr(cfg, "context_thread_backfill", True)
+    )
+
+
 def _roots(store, channel: str, only_root):
     """The root rows this call has to consider.
 
@@ -103,6 +130,34 @@ def _roots(store, channel: str, only_root):
         return [r for r in store.thread_roots(channel) if r["ts"] == only_root]
     row = lookup(channel, only_root)
     return [row] if row else []
+
+
+def _all_roots(store, cfg, channel: str, only_root):
+    """``_roots`` plus, when context is enabled, the ROOTLESS threads.
+
+    NO NETWORK HERE. The prefilter stays zero-token and zero-socket: a fetch on
+    this path would be unmetered work an ineligible thread could buy, since
+    every rung below runs before ``TokenBuckets.take``.
+    """
+    rows = list(_roots(store, channel, only_root))
+    if not _context_backfill(cfg):
+        return rows
+    seen = {r["ts"] for r in rows}
+    try:
+        if only_root is None:
+            extra = store.orphan_threads(channel)
+        else:
+            found = store.orphan_thread(channel, only_root)
+            extra = [found] if found else []
+    except AttributeError:  # an older store: behave exactly as before
+        return rows
+    rows.extend(r for r in extra if r["ts"] not in seen)
+    return rows
+
+
+def _rank(cand) -> tuple:
+    """Nomination rank, highest wins. Verifiable threads first, always."""
+    return (not cand.root_missing, cand.human_participants, cand.last_activity)
 
 
 def find_candidates(
@@ -154,7 +209,7 @@ def find_candidates(
             continue
 
         best: Candidate | None = None
-        for root in _roots(store, channel, only_root):
+        for root in _all_roots(store, cfg, channel, only_root):
             root_ts = root["ts"]
             if only_root is not None and root_ts != only_root:
                 continue
@@ -209,17 +264,30 @@ def find_candidates(
                 idle_minutes=int((now - last_activity) / 60),
                 last_activity=last_activity,
                 messages=msgs,
+                # The enricher MUST verify this one from Slack before it can be
+                # judged; a failed verification drops the nominee.
+                root_missing=bool(root.get("root_missing")),
             )
             # At most ONE candidate per channel per sweep (throughput limit).
             # The most engaged, most recently active thread wins: a
             # three-day-dead thread should not outrank one that stalled an
             # hour ago with four people in it.
-            if best is None or (cand.human_participants, cand.last_activity) > (
-                best.human_participants, best.last_activity
-            ):
+            #
+            # ROOTLESS THREADS RANK STRICTLY BELOW ROOTED ONES, and that is a
+            # starvation fix rather than a preference (found by an end-to-end
+            # smoke run, tests/test_context.py). A rootless thread the enricher
+            # can never verify — the bot is not in the channel, the token is
+            # missing — is dropped before the judge, and its decline
+            # deliberately consumes no re-judge watermark, so it returns on
+            # every tick. Ranked on recency alone it would hold the channel's
+            # single slot forever and silently suppress every healthy thread.
+            # The backfill is a recovery mechanism, not a priority: a rootless
+            # thread is still nominated whenever nothing rooted competes, which
+            # is exactly the case it exists for.
+            if best is None or _rank(cand) > _rank(best):
                 best = cand
         if best is not None:
             out.append(best)
 
-    out.sort(key=lambda c: (-c.human_participants, -c.last_activity))
+    out.sort(key=lambda c: (c.root_missing, -c.human_participants, -c.last_activity))
     return out[:cap]

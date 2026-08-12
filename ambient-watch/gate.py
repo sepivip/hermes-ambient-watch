@@ -273,7 +273,48 @@ def _split_usage(total: int, parts: int) -> list:
     return [base + (1 if i < extra else 0) for i in range(parts)]
 
 
-def run_gate(cfg, store, now: float | None = None, judge_fn=None, transport=None) -> str:
+def enrich_nominees(cfg, store, judgeable, now, reader=None, lines=None) -> list:
+    """Context fidelity, immediately before the judge call. Never raises.
+
+    PLACEMENT IS THE WHOLE ARGUMENT. This runs after the spend gate and (on the
+    arrival path) after the rate bucket, so there is at most ONE enrichment per
+    judgment: Slack call volume inherits the USD caps and the token buckets
+    exactly, and channel traffic appears in neither bound. A nominee whose
+    rootless thread cannot be verified against Slack is DROPPED here rather than
+    judged — ``record_decline`` consumes no watermark, so the sweep retries it.
+    """
+    if not getattr(cfg, "context_enabled", False) or not judgeable:
+        return list(judgeable)
+    try:
+        try:
+            from . import aw_context
+        except ImportError:
+            import aw_context
+
+        result = aw_context.enrich_for_judgment(
+            judgeable, cfg, store, aw_context.ContextCache(), reader, now
+        )
+    except Exception as exc:  # noqa: BLE001 — context is never load-bearing
+        record_gate_error(
+            f"context enrichment failed ({type(exc).__name__}), judging with "
+            f"ledger context only: {exc}",
+            data_dir=getattr(cfg, "data_dir", None),
+        )
+        return list(judgeable)
+    for cand, why in result.dropped:
+        store.record_decline(
+            cand.channel, cand.thread_ts, why, excerpt=cand.excerpt, now=now
+        )
+        if lines is not None:
+            lines.append(
+                f"ambient-watch: DROPPED {cand.channel}/{cand.thread_ts} "
+                f"[{cand.kind}] -- {why} (not judged, not posted)"
+            )
+    return result.keep
+
+
+def run_gate(cfg, store, now: float | None = None, judge_fn=None, transport=None,
+             reader=None) -> str:
     now = time.time() if now is None else now
     lines: list = []
     reportable = False  # True -> stdout is delivered to the ops channel
@@ -378,6 +419,11 @@ def run_gate(cfg, store, now: float | None = None, judge_fn=None, transport=None
                         )
                 continue
             judgeable.append(cand)
+
+        # ---- context fidelity, AFTER the spend gate -------------------
+        # A declined candidate must cost nothing at all — money, latency or
+        # Slack rate-limit budget — so nothing is fetched for one.
+        judgeable = enrich_nominees(cfg, store, judgeable, now, reader, lines)
 
         if judgeable:
             judge = judge_fn or aw_judge.judge

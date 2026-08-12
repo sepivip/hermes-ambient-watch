@@ -23,6 +23,11 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+try:  # real loader: package-relative
+    from . import aw_sanitize
+except ImportError:  # cron shim: flat import after sys.path.insert(plugin_dir)
+    import aw_sanitize
+
 logger = logging.getLogger("ambient_watch")
 
 # Keys the decision path no longer reads. Present in configs written before
@@ -51,6 +56,18 @@ _PASSTHROUGH_KEYS = (
     "arrival_burst",
     "arrival_max_pending",
     "arrival_pump_interval_seconds",
+    "context_enabled",
+    "context_thread_backfill",
+    "context_channel_history",
+    "context_channel_messages",
+    "context_channel_hours",
+    "context_topic",
+    "context_pins",
+    "context_pin_items",
+    "context_max_chars",
+    "context_fetch_timeout_seconds",
+    "context_total_timeout_seconds",
+    "context_cache_ttl_seconds",
     "caps_per_thread",
     "candidates_per_run",
     "self_quiet_after_ignored",
@@ -138,6 +155,36 @@ class AmbientConfig:
     arrival_max_pending: int = 200
     # Pump wake interval. Worst added latency is debounce + this.
     arrival_pump_interval_seconds: int = 5
+
+    # -- context fidelity (SHIPS DARK; see aw_context.py) -----------------
+    # Anthropic's spec: every Claude Tag session "reads its own thread and the
+    # channel's history, including pinned items". Ours saw only what our own
+    # ledger recorded since install. `context_enabled` is the master switch and
+    # the whole rollback: with it false nothing is fetched, no prompt changes by
+    # one byte, and a deployed config.json that has never heard of these keys
+    # behaves exactly as before.
+    context_enabled: bool = False
+    # Backfill a thread from conversations.replies. NOT an enrichment: a thread
+    # whose root row is absent is invisible to BOTH triggers, and admitting one
+    # without being able to fetch its root would be fail-open on the
+    # root-is-bot loop-safety rule — hence one boolean over both halves.
+    context_thread_backfill: bool = True
+    context_channel_history: bool = True
+    context_channel_messages: int = 6
+    context_channel_hours: int = 6
+    context_topic: bool = True
+    # OFF, and scope-gated: `pins:read` is NOT in the granted bot token, so it
+    # costs a manifest edit plus a human reinstall. It is also the stalest
+    # content and the least likely to change "does this thread need help right
+    # now", so it is last in priority and default false.
+    context_pins: bool = False
+    context_pin_items: int = 3
+    # THE ceiling, applied to the assembled block AFTER every section, which is
+    # what makes the worst-case prompt invariant to how much anyone posts.
+    context_max_chars: int = 4400
+    context_fetch_timeout_seconds: int = 4
+    context_total_timeout_seconds: int = 8
+    context_cache_ttl_seconds: int = 21600  # 6h, process-local, never persisted
 
     # -- noise controls that survive (Claude-Tag-native) ------------------
     caps_per_thread: int = 1          # once per thread, forever
@@ -299,6 +346,75 @@ def _clamp_arrival(cfg: AmbientConfig) -> AmbientConfig:
     return cfg
 
 
+def _int_in(value, floor: int, ceiling: int, default: int, label: str, warn) -> int:
+    out = _int_at_least(value, floor, default, label, warn)
+    if out > ceiling:
+        warn(
+            "ambient-watch: %s=%r is above the ceiling of %d; clamping",
+            label, out, ceiling,
+        )
+        return ceiling
+    return out
+
+
+def _clamp_context(cfg: AmbientConfig) -> AmbientConfig:
+    """Coerce the context knobs into a range that cannot misbehave.
+
+    Every clamp is a COST clamp as much as a correctness one: more context is
+    more prompt tokens is more money, so a typo here does not merely look
+    wrong, it spends. ``context_max_chars`` therefore has a hard ceiling that a
+    config file cannot exceed.
+
+    LOG LEVEL DEPENDS ON context_enabled, for exactly the reason
+    ``_clamp_arrival`` already does: while the feature is dark nothing below is
+    read by anything, and the acceptance test for a dark deploy is that the log
+    says nothing changed.
+    """
+    cfg.context_enabled = bool(cfg.context_enabled)
+    warn = logger.warning if cfg.context_enabled else logger.debug
+    cfg.context_thread_backfill = bool(cfg.context_thread_backfill)
+    cfg.context_channel_history = bool(cfg.context_channel_history)
+    cfg.context_topic = bool(cfg.context_topic)
+    cfg.context_pins = bool(cfg.context_pins)
+    cfg.context_channel_messages = _int_in(
+        cfg.context_channel_messages, 0, aw_sanitize.CTX_CHANNEL_MSGS, 6,
+        "context_channel_messages", warn,
+    )
+    cfg.context_channel_hours = _int_in(
+        cfg.context_channel_hours, 1, 72, 6, "context_channel_hours", warn
+    )
+    cfg.context_pin_items = _int_in(
+        cfg.context_pin_items, 0, aw_sanitize.CTX_PIN_ITEMS, 3,
+        "context_pin_items", warn,
+    )
+    # 6000 is the hard ceiling: at ~4 chars/token that is ~1500 prompt tokens
+    # per nominee, and three nominees a sweep must stay inside a $0.50/day cap.
+    cfg.context_max_chars = _int_in(
+        cfg.context_max_chars, 500, 6000, 4400, "context_max_chars", warn
+    )
+    cfg.context_fetch_timeout_seconds = _int_in(
+        cfg.context_fetch_timeout_seconds, 1, 20, 4,
+        "context_fetch_timeout_seconds", warn,
+    )
+    cfg.context_total_timeout_seconds = _int_in(
+        cfg.context_total_timeout_seconds, 1, 30, 8,
+        "context_total_timeout_seconds", warn,
+    )
+    if cfg.context_total_timeout_seconds < cfg.context_fetch_timeout_seconds:
+        warn(
+            "ambient-watch: context_total_timeout_seconds=%d is below "
+            "context_fetch_timeout_seconds=%d, which would forbid even one "
+            "fetch; raising it",
+            cfg.context_total_timeout_seconds, cfg.context_fetch_timeout_seconds,
+        )
+        cfg.context_total_timeout_seconds = cfg.context_fetch_timeout_seconds
+    cfg.context_cache_ttl_seconds = _int_in(
+        cfg.context_cache_ttl_seconds, 0, 86400, 21600,
+        "context_cache_ttl_seconds", warn,
+    )
+    return cfg
+
+
 def load_config(path: Path | None = None) -> AmbientConfig:
     """Load config.json from the plugin-data dir. Fail closed on absence."""
     data_dir = hermes_home() / "plugin-data" / "ambient_watch"
@@ -316,6 +432,7 @@ def load_config(path: Path | None = None) -> AmbientConfig:
             setattr(cfg, key, raw[key])
 
     _clamp_arrival(cfg)
+    _clamp_context(cfg)
 
     stale = [k for k in LEGACY_KEYS if k in raw]
     if stale:

@@ -5,6 +5,84 @@ later change. Newest first.
 
 ---
 
+## 2026-08-12 — Context fidelity (P1): four sections, one ceiling, shipped dark
+
+`aw_context.py`. Binding choices, so they are not re-litigated by a later change:
+
+**Priority order is by value-per-byte, and the ceiling is applied AFTER assembly.**
+`[THIS THREAD]` → `[CHANNEL]` → `[RECENT CHANNEL ACTIVITY]` → `[PINNED]`, filled until
+`context_max_chars` is gone. One ceiling over all four rather than four caps that could
+sum: that is what makes the worst-case prompt invariant to `context_channel_messages`,
+`context_pin_items` and to how much anyone posts. Consequence, on purpose: pins are
+structurally the first thing dropped under pressure and the thread is structurally never
+dropped.
+
+**Enrichment sits BELOW the spend gate and BELOW `TokenBuckets.take`.** That buys "at most
+one enrichment per judgment", so Slack call volume inherits the USD caps and the buckets
+exactly and channel traffic appears in neither bound. Accepted cost: a failed root backfill
+burns a bucket token without spending money — the conservative direction, since the buckets
+meter attempts by design.
+
+**A rootless thread is admitted only because the root can be fetched.** The relaxation in
+`find_candidates` and the `conversations.replies` backfill are behind ONE boolean
+(`context_thread_backfill`). Splitting them would let a config admit rootless threads while
+unable to fetch the root, which is fail-OPEN on the `root["is_bot"]` anti-feedback-loop
+rung. A failed backfill drops the nominee (`declined-root-unknown`), never judges it.
+
+**Rootless threads rank strictly BELOW rooted ones in the sweep's nomination.** Found by an
+end-to-end smoke run, not by design review: the sweep nominates one thread per channel, and
+a rootless thread that can never be verified (bot not in the channel, token missing) is
+dropped before the judge while its decline consumes no watermark — so on recency alone it
+would hold the channel's only slot forever and silently suppress every healthy thread. The
+backfill is a recovery mechanism, not a priority. Worth remembering: this feature's failure
+mode was *ambient going quiet*, which is the one this project fears most and the one that
+looks identical to a quiet week.
+
+**`ContextCache` is process-local memory and must never become a `flags` row.** Persisting
+a fetched topic or pin would create a new permanent copy of untrusted text — the exact
+category the 2026-08-11 incident came from. The fetch is cheap enough that persistence buys
+nothing. This is why "nothing new is written to disk" is architectural here rather than
+"sanitized before storage", and why a test diffs the whole data directory.
+
+**Thread replies are deliberately NOT cached across judgments**, unlike channel identity
+(6 h TTL). A thread's replies changing is the entire reason it gets re-judged, so a cached
+copy would make the second verdict reason about a stale thread. One fetch per *judgment* is
+the bound that matters, and judgments are already capped by the buckets and the USD limits —
+so freshness costs nothing that was not already bounded.
+
+**`judgments.excerpt` stays thread-only.** It is a per-thread operator-review artifact.
+Widening it to include a topic, a pin or channel history would put text from unrelated
+conversations into a thread's audit row, and would also add fetched text to disk.
+
+**`CONTEXT_RULES` is appended to the system turn only when a nominee carries a context
+block.** Unconditional rules would break the byte-identical dark-deploy guarantee and
+charge every operator for rules about sections that are not present. The guarantee is
+pinned by a golden hash of the assembled prompt.
+
+**`JUDGE_MAX_MESSAGES`/`JUDGE_MAX_VIEW_CHARS` were NOT raised.** The wider thread window
+(16 × 3 000) is passed in by the enricher as `CTX_THREAD_*`. Raising the defaults would
+have changed the prompt for a deployed config that has never heard of the context keys.
+
+**Pins are optional, off, and their absence is reported once.** `pins:read` is not in the
+granted bot token (17 scopes in `slack-manifest.json`; pins is not one), so they cost a
+manifest change plus a human Reinstall to Workspace. A `missing_scope` reply is cached for
+the process, written to the `context_pins_scope` flag from our OWN vocabulary, surfaced by
+`aw_status.py` with remediation, and never retried. One log line, not one per judgment.
+
+**Workspace search is not attempted and will not be.** `search.messages` needs the
+user-only `search:read` scope, so a bot token structurally cannot have it — and it would
+ingest text from channels nobody opted into, defeating the watched-channel perimeter.
+PARITY gap 5 stays open with that reason rather than as a TODO.
+
+**Mutation-verified, not just tested.** Nine load-bearing lines were individually broken to
+confirm a test fails. One survived first time: deleting `neutralize()` from the fetched
+topic still passed, because the join-level `_INJECTION` check redacted the whole block. The
+test was rewritten with a benign-but-structure-forging probe so it isolates the per-field
+layer. **A test that cannot tell which layer fired is not a test of that layer** — worth
+remembering for the other L1 assertions.
+
+---
+
 ## 2026-08-12 — The USD figures are MODELLED, not billed. Say so.
 
 `auth.json` shows the only configured provider is `openai-codex` with
