@@ -288,8 +288,16 @@ def build_messages(nominees) -> list:
     blocks = "\n\n".join(
         build_nominee_block(i, c) for i, c in enumerate(nominees)
     )
+    # A NOTE COUNTS, NOT ONLY A BLOCK. When every section failed to fetch, the
+    # nominee carries "context: channel history unavailable" and NO block — and
+    # the last paragraph of CONTEXT_RULES is the only thing that tells the model
+    # what that line means ("judge on what is present; never speculate about the
+    # missing part"). Keying on the block alone withheld the rule in precisely
+    # the degraded case it was written for. Still byte-identical while context is
+    # dark: neither field is ever set unless the enricher ran.
     rules = JUDGE_RULES
-    if any(getattr(c, "context_block", "") for c in nominees):
+    if any(getattr(c, "context_block", "") or getattr(c, "context_note", "")
+           for c in nominees):
         rules = f"{JUDGE_RULES}\n{CONTEXT_RULES}"
     return [
         {"role": "system", "content": rules},
@@ -300,6 +308,36 @@ def build_messages(nominees) -> list:
 # ~4 characters per token for English prose; the prompt is hard-capped by
 # aw_sanitize's judge profile, so this can never run away.
 _CHARS_PER_TOKEN = 4
+
+# A CHARACTER CAP IS NOT A TOKEN CAP, and this is the one place that difference
+# costs money. Every cap in aw_sanitize (JUDGE_MAX_VIEW_CHARS, CTX_TOTAL_CHARS,
+# the per-section caps) counts CHARACTERS, so a Georgian, Cyrillic, Hebrew or
+# CJK channel fills the identical ceiling with text a BPE tokenizer charges
+# 1-3 tokens per character for, against 0.25 for English prose. Measured on the
+# live install's worst case: 16.5k chars of Georgian is ~39k UTF-8 bytes, i.e.
+# roughly 4x the chars/4 figure. Since this estimate is the ONLY thing that
+# stops a provider which never answers from being re-billed on every tick (a
+# failed judgment writes no re-judge watermark), the optimistic number is the
+# dangerous one: the real bill would run ~4x past the configured cap before it
+# tripped. Pricing the non-ASCII part by its UTF-8 bytes leaves a pure-ASCII
+# prompt's estimate bit-for-bit unchanged.
+_BYTES_PER_TOKEN = 2
+
+
+def _weigh(text: str):
+    """``(ascii characters, UTF-8 bytes spent on everything else)``.
+
+    Returned unrounded so the caller can divide ONCE over the whole prompt: an
+    all-ASCII prompt then estimates to exactly the old ``chars // 4``, rather
+    than losing a token per message to floor division.
+    """
+    ascii_chars = 0
+    for char in text:
+        if char.isascii():
+            ascii_chars += 1
+    # An ASCII character is exactly one UTF-8 byte, so the remainder is the
+    # bytes contributed by everything else.
+    return ascii_chars, max(0, len(text.encode("utf-8", "replace")) - ascii_chars)
 
 
 def estimate_prompt_tokens(nominees) -> int:
@@ -319,12 +357,14 @@ def estimate_prompt_tokens(nominees) -> int:
     here must not turn a silent tick into a gate crash.
     """
     try:
-        chars = sum(
-            len(str(m.get("content") or "")) for m in build_messages(nominees)
-        )
+        plain, dense = 0, 0
+        for message in build_messages(nominees):
+            chars, dense_bytes = _weigh(str(message.get("content") or ""))
+            plain += chars
+            dense += dense_bytes
     except Exception:  # noqa: BLE001 — nothing was sent if the prompt is broken
         return 0
-    return max(1, chars // _CHARS_PER_TOKEN)
+    return max(1, plain // _CHARS_PER_TOKEN + dense // _BYTES_PER_TOKEN)
 
 
 # -- the call ---------------------------------------------------------------

@@ -69,6 +69,39 @@ def test_the_estimate_tracks_the_prompt_we_actually_sent(cfg):
     assert three < 4000
 
 
+def test_the_estimate_does_not_undercharge_a_non_ascii_prompt(cfg):
+    """A CHARACTER cap is not a TOKEN cap.
+
+    Every cap in ``aw_sanitize`` counts characters, so a Georgian, Cyrillic or
+    CJK thread fills the same ceiling with text a BPE tokenizer charges 1-3
+    tokens per character for, against 0.25 for English prose. This estimate is
+    the ONLY thing that stops a provider which never answers from being re-billed
+    on every tick (a failed judgment writes no re-judge watermark), so pricing
+    such a prompt at chars/4 would let the real bill run several times past the
+    configured cap before it trips. The English estimate must not move.
+    """
+    class Ascii(Nominee):
+        judge_view = "<untrusted-slack-text>\nA1: " + "who owns this? " * 60 \
+            + "\n</untrusted-slack-text>"
+
+    class Georgian(Nominee):
+        judge_view = "<untrusted-slack-text>\nA1: " + "ეს ვისი საქმეა " * 60 \
+            + "\n</untrusted-slack-text>"
+
+    assert len(Georgian.judge_view) <= len(Ascii.judge_view) + 60, (
+        "the two probes must be the same SIZE IN CHARACTERS, or the test is "
+        "measuring length rather than density"
+    )
+    ascii_est = aw_judge.estimate_prompt_tokens([Ascii()])
+    georgian_est = aw_judge.estimate_prompt_tokens([Georgian()])
+
+    plain = aw_judge.estimate_prompt_tokens([Nominee()])
+    assert plain == sum(
+        len(str(m.get("content") or "")) for m in aw_judge.build_messages([Nominee()])
+    ) // 4, "the ASCII estimate must stay exactly chars/4"
+    assert georgian_est > ascii_est * 1.5, (ascii_est, georgian_est)
+
+
 def test_a_reply_with_no_usage_and_no_verdicts_is_charged(cfg):
     """A 200 that omits usage and says nothing usable is still a paid call."""
     result = aw_judge.judge(

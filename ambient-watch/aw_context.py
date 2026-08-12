@@ -21,7 +21,13 @@ metered in USD:
    awareness" in the abstract, it is one specific false positive: *someone
    already answered in-channel instead of in-thread*, which
    ``answered-since-detection`` cannot see because it only looks inside the
-   thread. Sourced from the LEDGER first, so steady state costs zero calls.
+   thread. Sourced from the LEDGER first and fetched only when the ledger holds
+   fewer than ``context_channel_messages`` rows in the window. BUDGET WARNING,
+   measured rather than assumed: a QUIET channel is below that threshold almost
+   by definition, so the ledger-first rule saves the call in a BUSY channel and
+   costs one ``conversations.history`` per judgment in a quiet one. Do not read
+   it as "zero calls in steady state" — it is "zero calls where the answer was
+   already free".
 4. ``[PINNED]`` — OPTIONAL, OFF, scope-gated. ``pins:read`` is not granted on
    this install, so it costs a manifest edit plus a human reinstall.
 
@@ -39,7 +45,15 @@ relaxation and the backfill sit behind ONE boolean.
 
 WHERE IT SITS IN THE LADDER, and why that makes the rate-limit argument trivial:
 
-    prefilter (ZERO network) -> budget -> take token -> ENRICH (<=2 fetches) -> judge
+    prefilter (ZERO network) -> budget -> take token -> ENRICH (0-4 fetches) -> judge
+
+Steady state is ZERO fetches (a ledger-complete thread, a cached topic, enough
+ledger rows for the channel window) and the DEFAULT ceiling is 2 — a thread
+backfill plus a thin-ledger ``conversations.history``. The absolute worst case is
+4: those two plus a cold ``conversations.info`` and, only if an operator turned
+pins on, ``pins.list``. All of it inside ONE ``context_total_timeout_seconds``
+budget for the whole enrichment, so the LATENCY bound does not grow with the
+count.
 
 Placing enrichment after ``TokenBuckets.take`` gives the invariant **at most one
 enrichment per judgment**, so Slack call volume inherits the token buckets and
@@ -316,6 +330,12 @@ class SlackReader:
             ]
             out.append({
                 "ts": str(row.get("ts") or ""),
+                # Identifiers, copied as strings exactly like ``ts``: Slack
+                # generates them, nothing ever prints them, and the mute filter
+                # in _activity_section needs to know which thread a fetched row
+                # belongs to (conversations.history returns thread ROOTS, and a
+                # thread_broadcast carries thread_ts).
+                "thread_root": str(row.get("thread_ts") or row.get("ts") or ""),
                 "author": row.get("user") or None,
                 "is_bot": 0,
                 "text": text,
@@ -432,6 +452,30 @@ class ContextCache:
         self._data: dict = {}
         self.hits = 0
         self.misses = 0
+        self._batch = 0
+
+    def new_batch(self) -> int:
+        """Open a fresh scope for entries that must NOT outlive one enrichment.
+
+        Channel activity is the case this exists for. Its entire job is catching
+        "somebody already answered in the channel", which is a fact about *now* —
+        and the arrival runtime holds ONE cache for the whole gateway process, so
+        an entry with no expiry would freeze that window at whatever it was the
+        first time the process judged anything, in exactly the wrong direction
+        (the answer usually arrives after the first fetch). Channel identity is
+        the deliberate contrast: a topic does not change per message, so it keeps
+        the 6h TTL. Entries from older batches are dropped here, so the dict
+        cannot grow without bound in a long-lived process.
+        """
+        self._batch += 1
+        self._data = {
+            key: value for key, value in self._data.items()
+            if not (isinstance(key, tuple) and key and key[0] == "batch")
+        }
+        return self._batch
+
+    def batch_key(self, *parts) -> tuple:
+        return ("batch", self._batch, *parts)
 
     def get_or(self, key, ttl, producer):
         entry = self._data.get(key)
@@ -478,39 +522,40 @@ def section_lengths(block: str) -> dict:
     return out
 
 
-def _thread_section(cand, cfg, store, reader, notes) -> str:
+def _thread_section(cand, cfg, store, reader, notes, ceiling) -> str:
     """Fill ``[THIS THREAD]``, backfilling from Slack only when required.
 
-    Three triggers for a fetch, and no others:
-      * the root row is absent (``root_missing``) — a correctness fix;
-      * the thread began before we started watching the channel
-        (``root_ts < channel_first_ts``) — gateway downtime, pre-``--allow-all``
-        senders, pruned middles;
-      * nothing else. A ledger-complete thread costs zero calls, which is the
-        steady state.
+    ONE trigger for a fetch, and no others: the root row is absent
+    (``root_missing``). A thread the ledger holds a root for costs zero calls,
+    which is the steady state.
+
+    WHAT THIS DELIBERATELY DOES NOT REPAIR: a thread whose root we have but
+    whose MIDDLE messages we never recorded — gateway downtime, senders the
+    adapter filtered before ``SLACK_ALLOW_ALL_USERS``, pruned middles. There is
+    no free signal for it. An earlier version of this function tested
+    ``root_ts < store.channel_first_ts(channel)``, which reads plausibly and can
+    never be true: ``channel_first_ts`` is ``MIN(ts)`` over the same channel's
+    rows and a non-rootless candidate's root row is one of them, so the minimum
+    is always <= the root. It fetched nothing, ever. Detecting a hole for real
+    costs a ``conversations.replies`` on EVERY judgment, which is a money
+    decision an operator has to make explicitly — so the honest state is: the
+    judge may see a thread with a hole in it, and PARITY.md says so.
 
     Returns the reason to DROP the nominee, or "" to keep it.
     """
     root = cand.thread_ts
     msgs = list(cand.messages or [])
     need = bool(getattr(cand, "root_missing", False))
-    if not need:
-        try:
-            first = store.channel_first_ts(cand.channel)
-            need = first is not None and float(root) < float(first)
-        except (TypeError, ValueError):
-            need = False
     if not (need and getattr(cfg, "context_thread_backfill", True)):
         return ""
 
     body = reader.replies(cand.channel, root)
     if not body.get("ok") or not body.get("root_seen"):
-        if getattr(cand, "root_missing", False):
-            # FAIL CLOSED. Without the root we cannot answer "is this thread
-            # bot-authored?", and guessing would be fail-open on loop safety.
-            return "declined-root-unknown"
+        # FAIL CLOSED, always: the only trigger is a MISSING root, so a failed
+        # fetch leaves "is this thread bot-authored?" unanswered and guessing
+        # would be fail-open on the anti-feedback-loop rule.
         notes.add(NOTE_THREAD)
-        return ""
+        return "declined-root-unknown"
     if body.get("root_is_bot"):
         return "declined-bot-root"
 
@@ -519,8 +564,13 @@ def _thread_section(cand, cfg, store, reader, notes) -> str:
         by_ts[str(row.get("ts"))] = row
     merged = sorted(by_ts.values(), key=lambda r: str(r.get("ts")))
     cand.messages = merged
+    # The thread is spent from the SAME budget as the sections and is never
+    # dropped, so it may not exceed the whole ceiling on its own — otherwise a
+    # low `context_max_chars` produces a prompt LARGER than context-off while
+    # deleting every section (measured: 3050 chars at a ceiling of 500).
     cand.judge_view = aw_sanitize.build_judge_view(
-        merged, aw_sanitize.CTX_THREAD_MESSAGES, aw_sanitize.CTX_THREAD_VIEW_CHARS
+        merged, aw_sanitize.CTX_THREAD_MESSAGES,
+        min(aw_sanitize.CTX_THREAD_VIEW_CHARS, max(0, int(ceiling))),
     )
     return ""
 
@@ -543,6 +593,42 @@ def _channel_section(cand, cfg, cache, reader, ttl, notes) -> str:
     return "\n".join(parts)[:aw_sanitize.CTX_TOPIC_CHARS]
 
 
+def _mute_check(store, channel):
+    """Memoized "has a human muted this thread?", for one section build.
+
+    ``ambient mute`` is the only in-Slack control a human has for "leave this
+    thread alone", and the recorder deliberately keeps RECORDING a muted thread
+    (mute gates nomination, not the ledger). Before context fidelity that was
+    harmless, because a thread's text could only ever reach the prompt built for
+    that same thread — and a muted thread is never nominated.
+    ``[RECENT CHANNEL ACTIVITY]`` draws from the whole channel, so without this
+    filter mute would still stop us NUDGING a thread while quietly failing to
+    stop us reading it into a judgment about a different one and shipping it to
+    a model provider. That is not what the human was told mute means.
+
+    Bounded and cheap: at most ``want * 4`` plus the fetched rows' distinct
+    roots, each an indexed lookup on ``muted``'s (channel, thread_ts) primary
+    key, memoized per section build. Never raises — a ledger read must not break
+    a judgment — but note the failure direction is INCLUDE, matching every other
+    degradation here; the mute itself still blocks the nomination of that thread.
+    """
+    is_muted = getattr(store, "is_muted", None)
+    seen: dict = {}
+
+    def muted(root) -> bool:
+        key = str(root or "")
+        if not key or is_muted is None:
+            return False
+        if key not in seen:
+            try:
+                seen[key] = bool(is_muted(channel, key))
+            except Exception:  # noqa: BLE001 — degrade, never block a judgment
+                seen[key] = False
+        return seen[key]
+
+    return muted
+
+
 def _activity_section(cand, cfg, store, cache, reader, now, notes) -> str:
     """Recent channel activity — the LEDGER first, Slack only if it is thin."""
     want = int(getattr(cfg, "context_channel_messages", 0) or 0)
@@ -550,6 +636,7 @@ def _activity_section(cand, cfg, store, cache, reader, now, notes) -> str:
         return ""
     hours = int(getattr(cfg, "context_channel_hours", 6) or 6)
     since = float(now) - hours * 3600
+    muted = _mute_check(store, cand.channel)
 
     rows, bots = [], 0
     try:
@@ -559,15 +646,19 @@ def _activity_section(cand, cfg, store, cache, reader, now, notes) -> str:
                 continue
             if str(row.get("thread_root")) == str(cand.thread_ts):
                 continue  # already in [THIS THREAD]
+            if muted(row.get("thread_root")):
+                continue  # a human said to leave that thread alone
             rows.append(row)
     except Exception:  # noqa: BLE001 — a ledger read must not break a judgment
         logger.debug("ambient-watch: ledger channel window failed", exc_info=True)
 
     if len(rows) < want:
-        # Cold start, post-restart, or after quiet hours. Cached per channel for
-        # the life of the sweep/judgment so N nominees cost one call.
+        # Cold start, post-restart, or after quiet hours. Cached in the BATCH
+        # scope: shared by every nominee in this one enrichment, and never reused
+        # by the next one — see ContextCache.new_batch for why that direction of
+        # staleness would defeat the section's whole purpose.
         body = cache.get_or(
-            ("history", cand.channel), None,
+            cache.batch_key("history", cand.channel), None,
             lambda: reader.history(cand.channel, want, since),
         )
         if body.get("ok"):
@@ -577,6 +668,12 @@ def _activity_section(cand, cfg, store, cache, reader, now, notes) -> str:
                 if str(row.get("ts")) in seen:
                     continue
                 if str(row.get("ts")) == str(cand.thread_ts):
+                    continue
+                # Same mute rule on the OTHER source, or the filter would only
+                # cover the steady state: conversations.history returns thread
+                # ROOTS, which is exactly how a muted thread arrives here when
+                # the ledger is thin.
+                if muted(row.get("thread_root") or row.get("ts")):
                     continue
                 rows.append(row)
         else:
@@ -648,12 +745,13 @@ def enrich_for_judgment(cands, cfg, store, cache=None, reader=None, now=None):
     # cumulative counters on every judgment would compound them quadratically.
     before = dict(getattr(reader, "stats", {}) or {})
     cache_before = cache.stats()
+    cache.new_batch()  # scope for entries that must not outlive this enrichment
 
     keep, dropped, snapshot = [], [], {}
     for cand in cands:
         notes: set = set()
         try:
-            drop = _thread_section(cand, cfg, store, reader, notes)
+            drop = _thread_section(cand, cfg, store, reader, notes, ceiling)
             if drop:
                 dropped.append((cand, drop))
                 continue
@@ -671,14 +769,19 @@ def enrich_for_judgment(cands, cfg, store, cache=None, reader=None, now=None):
             budget = max(0, ceiling - len(cand.judge_view or ""))
             cand.context_block = aw_sanitize.build_context_block(sections, budget)
             cand.context_note = ", ".join(sorted(notes))
+            measured = section_lengths(cand.context_block)
             snapshot = {
                 "chars": len(cand.judge_view or "") + len(cand.context_block),
                 "thread_msgs": len(cand.messages or []),
                 "context_chars": len(cand.context_block),
+                # Which sections actually SURVIVED the ceiling, and how big each
+                # one ended up. This is the ops answer to "what did the judge
+                # see?" that carries no text: a section that was clipped away
+                # under budget simply is not here.
                 "sections": [
-                    label for label, body in sections
-                    if body and f"[{label}]" in cand.context_block
+                    label for label, _body in sections if label in measured
                 ],
+                "section_chars": {k: int(v) for k, v in measured.items()},
                 "notes": sorted(notes),
                 "fetches": int(
                     reader.stats.get("fetches", 0) - (before.get("fetches") or 0)

@@ -266,9 +266,9 @@ that matters when every character is metered in USD:
 
 | # | Section | Where it comes from | Fetched only when |
 |---|---|---|---|
-| 1 | `[THIS THREAD]` | `store.thread_messages()` | the root row is **absent**, or the thread began before we started watching (`root_ts < MIN(ts)` for the channel) |
+| 1 | `[THIS THREAD]` | `store.thread_messages()` | the root row is **absent** — that one trigger and no other |
 | 2 | `[CHANNEL]` — name/topic/purpose, ≤200 chars | — | `conversations.info`, once per channel per 6 h (`context_cache_ttl_seconds`) |
-| 3 | `[RECENT CHANNEL ACTIVITY]` — ≤6 msgs, ≤900 chars | `store.recent_channel_messages()` | `conversations.history` **only** when the ledger yields fewer than `context_channel_messages` rows inside `context_channel_hours` — cold start, post-restart, after quiet hours. Steady state: **zero calls** |
+| 3 | `[RECENT CHANNEL ACTIVITY]` — ≤6 msgs, ≤900 chars | `store.recent_channel_messages()` | `conversations.history` **only** when the ledger yields fewer than `context_channel_messages` rows inside `context_channel_hours`. **Measured, not assumed:** that is a busy channel's steady state, not a quiet one's — a quiet channel is below the threshold almost by definition and pays one call per judgment |
 | 4 | `[PINNED]` — ≤3 items, ≤450 chars | — | `pins.list`, **off by default**, scope-gated (see below) |
 
 **Fill order under budget is the cost design, not a detail.** Sections are
@@ -308,6 +308,20 @@ Admitting rootless threads *without* the ability to fetch the root would be
 fail-open on loop safety. That is why the relaxation and the backfill are one
 switch and not two.
 
+**What the backfill deliberately does NOT repair: a thread whose root we have
+but whose middle messages we never recorded** — gateway downtime, senders the
+Slack adapter filtered out before `SLACK_ALLOW_ALL_USERS`, replies pruned from
+under a live root. The judge sees the thread with the hole in it, and can
+therefore still call a thread unanswered that was answered by a message the
+ledger never held. This is a *known* gap, not a fixed one: an earlier version of
+`_thread_section` tested `root_ts < store.channel_first_ts(channel)`, which reads
+plausibly and can never be true — `channel_first_ts` is `MIN(ts)` over the same
+channel's rows, and a rooted candidate's own root row is one of them, so the
+minimum is always ≤ the root. It fetched nothing, ever, and was removed rather
+than left to imply a repair that never happened. Detecting a hole for real costs
+a `conversations.replies` on **every** judgment, which is a money decision an
+operator has to make deliberately rather than inherit from a default.
+
 **And rootless threads rank strictly below rooted ones.** This one was found by
 an end-to-end smoke run rather than by design: the sweep nominates one thread per
 channel, ranked by (participants, last activity), and a rootless thread that can
@@ -323,8 +337,15 @@ nominated whenever nothing rooted competes, which is the case it exists for
 ### Where it sits in the ladder
 
 ```
-prefilter (ZERO network)  →  budget  →  take token  →  enrich (≤2 fetches)  →  judge
+prefilter (ZERO network)  →  budget  →  take token  →  enrich (0-4 fetches)  →  judge
 ```
+
+Steady state is **zero** fetches — a ledger-complete thread, a cached topic and
+enough ledger rows for the channel window answer everything. Two is the practical
+ceiling (a thread backfill plus a thin-ledger `conversations.history`); four is
+the absolute worst case, adding a cold `conversations.info` and, only if an
+operator turned pins on, `pins.list`. The *latency* bound does not grow with the
+count: all of them share one `context_total_timeout_seconds` budget.
 
 Placing enrichment after `TokenBuckets.take` buys the invariant that makes the
 rate-limit argument trivial: **at most one enrichment per judgment**, so Slack
@@ -439,6 +460,23 @@ Against the caps on this install (`daily_usd_per_channel` 0.50,
 - rate buckets still cannot outrun the USD caps, which is the property that had
   to survive.
 
+**Every figure above is for ENGLISH text, and a character cap is not a token
+cap.** All the caps here count characters, so a Georgian, Russian or Japanese
+channel fills the identical 4 400-character ceiling with text a BPE tokenizer
+charges far more for: measured on the worst case above, 16 511 characters of
+Georgian is 39 007 UTF-8 bytes, i.e. roughly **4× the `chars / 4` token figure**
+(~2 tokens per character instead of 0.25). On a non-Latin channel read the table
+as: arrival ~$0.046 rather than $0.0181, and the binding monthly cap as **~3.6
+judgments/day rather than ~9**. Nothing breaks — `aw_budget` meters the
+provider's OWN reported usage, so the caps still decline at the right dollar —
+but the *throughput* estimate above is optimistic by that factor, and the
+per-call overshoot past a cap is correspondingly larger. `estimate_prompt_tokens`
+(the fallback charged when a provider reports no usage at all) prices the
+non-ASCII part by its UTF-8 bytes for exactly this reason: it is the only thing
+that stops a permanently failing provider from being re-billed every tick, so it
+must not be the optimistic number
+(`tests/test_judge_cost.py::test_the_estimate_does_not_undercharge_a_non_ascii_prompt`).
+
 **A busy channel cannot inflate one judge call, and that is provable rather than
 asserted.** The ceiling is applied to the assembled block *after* every section,
 so the worst-case prompt is invariant to `context_channel_messages`,
@@ -471,6 +509,23 @@ Two things genuinely get worse, and neither is a disk or a tool exposure.
    can attempt to influence a verdict on a thread it is not in. Bounded to ≤6
    messages × 160 chars from watched channels only, and the judge is told
    explicitly that a verdict must be about the labelled thread only.
+
+**`ambient mute` had to be widened from "do not nudge" to "do not read".** The
+recorder deliberately keeps recording a muted thread (mute gates nomination, not
+the ledger), which was harmless while a thread's text could only ever reach the
+prompt built for that same thread — and a muted thread is never nominated.
+`[RECENT CHANNEL ACTIVITY]` draws from the whole channel, so the first
+implementation would have let a muted thread's messages reach the judge prompt
+for a *different* thread, and from there a model provider: mute would have stopped
+us nudging while quietly failing to stop us reading. `_mute_check` now filters
+muted threads out of **both** sources — the ledger window and
+`conversations.history` (which returns thread roots, so it is how a muted thread
+arrives when the ledger is thin). Bounded and cheap: memoized per section build,
+each lookup an indexed hit on `muted`'s primary key
+(`tests/test_context.py::test_a_muted_thread_never_reaches_another_threads_prompt`,
+`::test_a_muted_thread_is_filtered_out_of_fetched_channel_history`). Known gap:
+`[PINNED]` is not filtered this way — `pins.list` items carry no reliable thread
+context — which is one more reason `context_pins` is off by default.
 
 What does **not** change:
 
@@ -529,6 +584,7 @@ test fails:
 | judge a rootless thread whose backfill failed | `test_a_rootless_thread_whose_backfill_fails_is_dropped_not_judged` |
 | revert the `prune()` root-retention fix | `test_prune_stops_manufacturing_rootless_threads` |
 | let a rootless thread outrank a rooted one | `test_a_rootless_thread_never_crowds_out_a_healthy_candidate` |
+| cache fetched channel activity outside the per-enrichment batch scope | `test_fetched_channel_activity_is_not_reused_across_judgments` |
 
 The per-field sanitizer mutation is worth singling out: it **survived** the first
 attempt, because a probe that is instruction-shaped gets the whole block redacted
@@ -887,14 +943,14 @@ numbers only.
 | `arrival_max_pending` | 200 | cap on the in-memory pending map; over cap the **new** entry is dropped and counted (the sweep is the backstop, so the loss is latency) |
 | `arrival_pump_interval_seconds` | 5 | pump wake interval; worst added latency is debounce + this |
 | `context_enabled` | **false** | ships dark. `false` ⇒ nothing is fetched, the judge prompt is **byte-identical** to the sweep-only build, and a deployed `config.json` without any `context_*` key behaves exactly as before. **This is the rollback: one boolean.** |
-| `context_thread_backfill` | true | `conversations.replies` when the ledger has no root row (or the thread predates the ledger). Also gates admitting rootless threads at all — one switch, because admitting them without being able to fetch the root would be fail-open on the root-is-bot rule |
+| `context_thread_backfill` | true | `conversations.replies` when the ledger has no root row — that trigger only; a thread with a recorded root but missing middles is *not* repaired (see above). Also gates admitting rootless threads at all — one switch, because admitting them without being able to fetch the root would be fail-open on the root-is-bot rule |
 | `context_topic` | true | `[CHANNEL]` — name/topic/purpose, ≤200 chars, one `conversations.info` per channel per TTL |
 | `context_channel_history` | true | `[RECENT CHANNEL ACTIVITY]`, ledger-first |
 | `context_channel_messages` | 6 | messages in that section; clamped to ≤`CTX_CHANNEL_MSGS` (6). Raising it cannot grow the prompt — the ceiling is applied after assembly |
 | `context_channel_hours` | 6 | how far back that window looks |
 | `context_pins` | **false** | `[PINNED]`. Needs the `pins:read` bot scope, which is **not granted** on this install: an app-manifest change plus a human reinstall. Absent scope ⇒ section skipped, reported once |
 | `context_pin_items` | 3 | pinned items, ≤450 chars total |
-| `context_max_chars` | 4400 | **THE ceiling**, over all four sections together, applied *after* assembly. Clamped to ≤6000 so a config typo cannot inflate every prompt |
+| `context_max_chars` | 4400 | **THE ceiling**, over the thread view and all four sections together, applied *after* assembly. Clamped to ≤6000 so a config typo cannot inflate every prompt, and to ≥3040 (`CTX_THREAD_VIEW_CHARS + CTX_MIN_SECTION_CHARS`) because the thread is spent first and never dropped: a lower value deletes every context section while leaving the prompt *larger* than with context off, which is a knob that lies rather than a knob that saves money |
 | `context_fetch_timeout_seconds` | 4 | per Slack call |
 | `context_total_timeout_seconds` | 8 | for the **whole** enrichment, so a hung socket cannot park a worker thread or stall cron |
 | `context_cache_ttl_seconds` | 21600 | 6 h, for channel identity/pins. Process-local memory, **never persisted** |

@@ -179,8 +179,12 @@ class AmbientConfig:
     # now", so it is last in priority and default false.
     context_pins: bool = False
     context_pin_items: int = 3
-    # THE ceiling, applied to the assembled block AFTER every section, which is
-    # what makes the worst-case prompt invariant to how much anyone posts.
+    # THE ceiling on thread view + context sections together, applied AFTER
+    # every section, which is what makes the worst-case prompt invariant to how
+    # much anyone posts. The THREAD is spent first and is never dropped, so this
+    # cannot be set below what the thread window itself costs — see
+    # CONTEXT_MAX_CHARS_FLOOR: a lower value would silently buy nothing but a
+    # bigger prompt (the sections vanish while the thread view stays).
     context_max_chars: int = 4400
     context_fetch_timeout_seconds: int = 4
     context_total_timeout_seconds: int = 8
@@ -346,6 +350,17 @@ def _clamp_arrival(cfg: AmbientConfig) -> AmbientConfig:
     return cfg
 
 
+#: The smallest honest value for `context_max_chars`: the thread window plus
+#: room for one section that still means something. Derived, so it tracks the
+#: sanitizer's caps instead of drifting from them — and read through getattr,
+#: because this is module-import time: an AttributeError here would fail the
+#: whole config load (and therefore the whole plugin) rather than one clamp.
+CONTEXT_MAX_CHARS_FLOOR = (
+    getattr(aw_sanitize, "CTX_THREAD_VIEW_CHARS", 3000)
+    + getattr(aw_sanitize, "CTX_MIN_SECTION_CHARS", 40)
+)
+
+
 def _int_in(value, floor: int, ceiling: int, default: int, label: str, warn) -> int:
     out = _int_at_least(value, floor, default, label, warn)
     if out > ceiling:
@@ -389,8 +404,18 @@ def _clamp_context(cfg: AmbientConfig) -> AmbientConfig:
     )
     # 6000 is the hard ceiling: at ~4 chars/token that is ~1500 prompt tokens
     # per nominee, and three nominees a sweep must stay inside a $0.50/day cap.
+    #
+    # THE FLOOR IS NOT COSMETIC. `enrich_for_judgment` spends this budget on the
+    # thread view FIRST and never drops it, so a ceiling below the thread window
+    # is a knob that lies: it deletes every context section and leaves the prompt
+    # LARGER than with context off. Measured before this floor existed:
+    # context_max_chars=500 on a backfilled thread produced 3050 chars, against
+    # 2450 for the same thread with context disabled. Refusing the value is the
+    # only honest option, because the alternative — truncating the thread view —
+    # would let a context knob degrade the judgment's primary evidence.
     cfg.context_max_chars = _int_in(
-        cfg.context_max_chars, 500, 6000, 4400, "context_max_chars", warn
+        cfg.context_max_chars, CONTEXT_MAX_CHARS_FLOOR, 6000, 4400,
+        "context_max_chars", warn,
     )
     cfg.context_fetch_timeout_seconds = _int_in(
         cfg.context_fetch_timeout_seconds, 1, 20, 4,

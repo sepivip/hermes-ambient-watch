@@ -523,6 +523,117 @@ def test_channel_history_is_fetched_only_when_the_ledger_is_thin(cfg, store):
     assert "infra owns the runbook" in block
 
 
+def test_fetched_channel_activity_is_not_reused_across_judgments(cfg, store):
+    """The whole POINT of this section is catching "somebody already answered in
+    the channel", which is a fact about NOW. The arrival runtime holds one cache
+    for the entire gateway process, so a cache entry with no expiry would freeze
+    channel activity at whatever it was the first time the process judged
+    anything — and freeze it in exactly the direction that matters (the answer
+    arrives *after* the first fetch). Cached within one enrichment, never across.
+    """
+    _ctx_cfg(cfg, context_topic=False, context_channel_messages=4)
+    _seed_thread(cfg, store)
+    answered = "answered here already: infra owns the runbook"
+    calls = {"n": 0}
+
+    def history(params, n):
+        calls["n"] = n
+        if n == 1:
+            return {"ok": True, "messages": [_msg("1754900500.000100", "morning all")]}
+        return {"ok": True, "messages": [_msg("1754900600.000100", answered)]}
+
+    reader = _reader(Fetch(conversations_history=history))
+    cache = aw_context.ContextCache()
+
+    first = _enrich(_candidates(cfg, store), cfg, store,
+                    reader=reader, cache=cache).keep[0].context_block
+    second = _enrich(_candidates(cfg, store), cfg, store,
+                     reader=reader, cache=cache).keep[0].context_block
+
+    assert calls["n"] == 2, "the second judgment reused a stale channel window"
+    assert "morning all" in first
+    assert answered in second, second
+
+
+def test_channel_identity_IS_reused_across_judgments(cfg, store):
+    """The contrast that makes the rule above a decision rather than an
+    oversight: a topic does not change per message, so it is cached for 6h."""
+    _ctx_cfg(cfg, context_channel_history=False)
+    _seed_thread(cfg, store)
+    fetch = Fetch(**_info(topic="prod incidents only"))
+    reader, cache = _reader(fetch), aw_context.ContextCache()
+
+    for _ in range(3):
+        _enrich(_candidates(cfg, store), cfg, store, reader=reader, cache=cache)
+
+    assert fetch.methods.count("conversations.info") == 1
+
+
+MUTED_SECRET = "the offer letter for the HR case is in the shared drive"
+
+
+def _seed_muted_thread(cfg, store, root_ts=T0 + 10):
+    """A second thread a HUMAN muted with ``ambient mute``, still being typed in.
+
+    The recorder deliberately keeps recording a muted thread (mute gates
+    nomination, not the ledger), so these rows are in the channel window that
+    ``[RECENT CHANNEL ACTIVITY]`` draws from.
+    """
+    decide(make_event(text="hr escalation, please stay out",
+                      ts=f"{root_ts:.6f}", user="U0HUMAN009"), cfg, store)
+    decide(make_event(text="ambient mute", ts=f"{root_ts + 5:.6f}",
+                      thread_ts=f"{root_ts:.6f}", user="U0HUMAN009"), cfg, store)
+    decide(make_event(text=MUTED_SECRET, ts=f"{root_ts + 10:.6f}",
+                      thread_ts=f"{root_ts:.6f}", user="U0HUMAN009"), cfg, store)
+    assert store.is_muted(WATCHED, f"{root_ts:.6f}"), "fixture did not mute"
+    return f"{root_ts:.6f}"
+
+
+def test_a_muted_thread_never_reaches_another_threads_prompt(cfg, store):
+    """``ambient mute`` is the ONE in-Slack control a human has for "leave this
+    thread alone", and before context fidelity a muted thread's text could not
+    reach a prompt at all. ``[RECENT CHANNEL ACTIVITY]`` draws from the whole
+    channel, so without this filter mute would still stop us NUDGING a thread
+    while quietly failing to stop us READING it into a judgment about a
+    different one — and shipping it to a model provider.
+    """
+    _ctx_cfg(cfg, context_topic=False, context_channel_messages=6)
+    _seed_thread(cfg, store)
+    _seed_muted_thread(cfg, store)
+
+    cands = _enrich(_candidates(cfg, store), cfg, store, Fetch()).keep
+
+    assert [c.thread_ts for c in cands] == [f"{T0:.6f}"], "wrong candidate"
+    block = cands[0].context_block
+    assert MUTED_SECRET not in block, block
+    assert "stay out" not in block, block
+
+
+def test_a_muted_thread_is_filtered_out_of_fetched_channel_history(cfg, store):
+    """Same rule on the OTHER source. ``conversations.history`` returns
+    top-level channel messages, so a muted thread's root arrives that way even
+    when the ledger has nothing — the filter has to cover both or it only
+    covers the steady state.
+    """
+    _ctx_cfg(cfg, context_topic=False, context_channel_messages=4)
+    _seed_thread(cfg, store)
+    muted_root = _seed_muted_thread(cfg, store, root_ts=T0 + 10)
+    fetch = Fetch(**_history(
+        _msg(muted_root, "hr escalation, please stay out", user="U0HUMAN009"),
+        _msg(f"{T0 + 15:.6f}", MUTED_SECRET, user="U0HUMAN009",
+             thread_ts=muted_root),
+        _msg("1754900500.000100", "infra owns the runbook", user="U0HUMAN00X"),
+    ))
+
+    cands = _enrich(_candidates(cfg, store), cfg, store, fetch).keep
+
+    assert "conversations.history" in fetch.methods, "not vacuous: it fetched"
+    block = cands[0].context_block
+    assert "infra owns the runbook" in block, "the innocent row must survive"
+    assert MUTED_SECRET not in block, block
+    assert "stay out" not in block, block
+
+
 def test_bots_and_join_noise_are_filtered_out_of_fetched_context(cfg, store):
     """Anthropic filters other bots' replies; for us it is also budget
     defence — one chatty CI webhook would otherwise eat the whole window."""
@@ -953,7 +1064,9 @@ def test_context_records_what_the_last_judgment_saw_in_numbers_only(cfg, store):
 
     snap = json.loads(store.get_flag(aw_context.LAST_FLAG))
     assert snap["chars"] > 0
-    assert snap["sections"]
+    assert snap["sections"] == ["CHANNEL", "RECENT CHANNEL ACTIVITY"]
+    assert snap["section_chars"]["CHANNEL"] > 0
+    assert sum(snap["section_chars"].values()) <= snap["context_chars"]
     blob = json.dumps(snap).casefold()
     for leak in ("prod incidents", "morning all", "migration runbook"):
         assert leak not in blob, "the ops surface leaked channel text"
@@ -1089,3 +1202,97 @@ def test_prune_stops_manufacturing_rootless_threads(cfg, store):
         "the root row was pruned out from under a thread that is still active"
     )
     assert store.thread_root(WATCHED, dead_root) is None
+
+
+# ------------------------------------------- verify pass, 2026-08-12 (regression)
+# Three findings from the correctness/regression lens, each with the failing
+# scenario that produced it.
+
+
+def test_a_thread_with_a_recorded_root_is_never_backfilled(cfg, store):
+    """The backfill has exactly ONE trigger: a MISSING root row.
+
+    A second trigger was written for "the thread began before we started
+    watching" (``root_ts < channel_first_ts``) and could never fire —
+    ``channel_first_ts`` is ``MIN(ts)`` over the same channel's rows, and a
+    rooted candidate's own root row is one of them. This pins the honest
+    behaviour so nobody re-derives the impossible condition: a thread with a
+    recorded root and a HOLE in the middle is judged with the hole, at the cost
+    of zero Slack calls.
+    """
+    _ctx_cfg(cfg, context_topic=False, context_channel_history=False)
+    decide(make_event(text=BENIGN_ROOT, ts=f"{T0:.6f}"), cfg, store)
+    decide(make_event(text="any update?", ts=f"{T0 + 3000:.6f}",
+                      thread_ts=f"{T0:.6f}", user="U0HUMAN002"), cfg, store)
+    cands = _candidates(cfg, store, now=T0 + 9000)
+    assert cands and cands[0].root_missing is False, "not vacuous"
+    fetch = Fetch(**_replies(
+        _msg(f"{T0:.6f}", BENIGN_ROOT),
+        _msg(f"{T0 + 600:.6f}", "MIDDLE THE LEDGER NEVER SAW", user="U0HUMAN003"),
+        _msg(f"{T0 + 3000:.6f}", "any update?", user="U0HUMAN002"),
+    ))
+
+    _enrich(cands, cfg, store, fetch, now=T0 + 9000)
+
+    assert fetch.methods == [], "a rooted thread paid for a conversations.replies"
+    assert "MIDDLE" not in cands[0].judge_view
+    # And the condition that used to gate it is unreachable, by construction.
+    first = store.channel_first_ts(WATCHED)
+    for root in store.thread_roots(WATCHED):
+        assert not (float(root["ts"]) < float(first))
+
+
+def test_the_ceiling_cannot_be_set_below_what_the_thread_costs(cfg, store):
+    """MUTATION TARGET. ``context_max_chars`` is spent on the thread FIRST and
+    the thread is never dropped, so a ceiling under the thread window deletes
+    every context section AND leaves the prompt larger than with context off.
+    Measured before the floor existed: ceiling 500 -> 3050 chars, against 2450
+    for the same thread with context disabled."""
+    from aw_config import CONTEXT_MAX_CHARS_FLOOR, _clamp_context
+
+    cfg_low = _ctx_cfg(cfg, context_max_chars=500)
+    _clamp_context(cfg_low)
+    assert cfg_low.context_max_chars == CONTEXT_MAX_CHARS_FLOOR
+    assert CONTEXT_MAX_CHARS_FLOOR >= aw_sanitize.CTX_THREAD_VIEW_CHARS
+
+    # Belt and braces for a cfg built in code rather than loaded from disk: the
+    # backfilled thread view honours the ceiling it was handed.
+    _ctx_cfg(cfg, context_max_chars=500, context_topic=False,
+             context_channel_history=False)
+    _seed_rootless(cfg, store)
+    long_line = "x" * 380
+    fetch = Fetch(**_replies(*(
+        [_msg(f"{T0:.6f}", "root " + long_line)]
+        + [_msg(f"{T0 + 60 * i:.6f}", f"reply{i} " + long_line,
+                user=f"U0HUMAN{i:03d}") for i in range(1, 15)]
+    )))
+    cands = _enrich(_candidates(cfg, store), cfg, store, fetch).keep
+    assert cands, "not vacuous: the rootless thread was admitted"
+    total = len(cands[0].judge_view) + len(cands[0].context_block)
+    assert total <= 500 + 120, total
+
+
+def test_a_degradation_note_brings_the_context_rules_with_it(cfg, store):
+    """When every section fails, the nominee carries
+    ``context: channel history unavailable`` and NO block — and the last
+    paragraph of CONTEXT_RULES is the only thing telling the model what that
+    line means. Keying the rules on the block alone withheld them in exactly
+    the degraded case they were written for."""
+    _ctx_cfg(cfg)
+    _seed_thread(cfg, store)
+    fetch = Fetch()  # nothing faked: every section fails
+
+    cands = _enrich(_candidates(cfg, store), cfg, store, fetch).keep
+
+    assert cands[0].context_note, "not vacuous: a degradation was noted"
+    assert cands[0].context_block == "", "not vacuous: there is no block"
+    system = aw_judge.build_messages(cands)[0]["content"]
+    assert aw_judge.CONTEXT_RULES in system
+    # Still byte-identical while dark: neither field is set unless we enriched.
+    import aw_detectors
+
+    bare = aw_detectors.Candidate(
+        channel=WATCHED, thread_ts=f"{T0:.6f}", kind="stalled_thread", target="x",
+        excerpt="", judge_view=aw_sanitize.build_judge_view([]),
+    )
+    assert aw_judge.CONTEXT_RULES not in aw_judge.build_messages([bare])[0]["content"]

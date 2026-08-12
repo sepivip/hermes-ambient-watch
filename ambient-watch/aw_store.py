@@ -227,9 +227,14 @@ class AmbientStore:
     def channel_first_ts(self, channel):
         """"When did we start watching this channel", derived not stored.
 
-        MIN(ts) is the watermark that tells the enricher a thread began before
-        the ledger existed and therefore needs a ``conversations.replies``
-        backfill. Derived, so it needs no migration and cannot drift.
+        NOT LOAD-BEARING, and deliberately kept anyway. `aw_context` used to
+        compare a candidate's root against this to decide "the thread began
+        before the ledger existed, so backfill it" — a comparison that can never
+        be true, because a rooted candidate's own root row is one of the rows
+        this MIN runs over. The enricher no longer consults it (see
+        `_thread_section`); it remains as the honest primitive for anyone who
+        later implements gap repair with a real signal and an explicit budget.
+        Derived, so it needs no migration and cannot drift.
         """
         with self._lock:
             row = self._db.execute(

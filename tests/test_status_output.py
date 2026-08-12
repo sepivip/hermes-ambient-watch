@@ -205,6 +205,7 @@ def test_the_context_section_reports_counts_and_never_fetched_text(
     store.set_flag("context_last", json.dumps({
         "chars": 4100, "context_chars": 1100, "thread_msgs": 7,
         "sections": ["CHANNEL", "RECENT CHANNEL ACTIVITY"],
+        "section_chars": {"CHANNEL": 201, "RECENT CHANNEL ACTIVITY": 901},
         "notes": ["pinned items unavailable"], "fetches": 2, "at": T0,
     }))
     store.close()
@@ -218,7 +219,9 @@ def test_the_context_section_reports_counts_and_never_fetched_text(
     assert "judgments=3" in out and "fetches=4" in out and "rate_limited=1" in out
     assert "4100 chars total" in out and "1100 of them context" in out
     assert "7 thread message(s)" in out and "2 Slack call(s)" in out
-    assert "CHANNEL, RECENT CHANNEL ACTIVITY" in out
+    assert "CHANNEL 201ch, RECENT CHANNEL ACTIVITY 901ch" in out, (
+        "per-section sizes are how an operator sees the ceiling doing its job"
+    )
     assert "pinned items unavailable" in out
     assert "4400 chars per nominee" in out
 

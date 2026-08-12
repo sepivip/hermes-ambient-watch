@@ -248,6 +248,15 @@ def context_section(db, cfg):
     enabled = bool(cfg.get("context_enabled", False))
     print("\nCONTEXT FIDELITY (what the judge is allowed to see)")
     print(f"  context_enabled   : {'ON' if enabled else 'off (ledger thread only)'}")
+    if not enabled:
+        # Say it once, plainly: everything below is the value a flip WOULD use.
+        # An operator reading "thread backfill: on" under a dark master switch
+        # would otherwise think the fetching is already happening.
+        print("                      ^ MASTER SWITCH. Everything below is inert"
+              " until this is")
+        print("                        true -- nothing is fetched and the judge"
+              " prompt is")
+        print("                        byte-identical to the sweep-only build.")
     print(f"  thread backfill   : "
           f"{'on' if cfg.get('context_thread_backfill', True) else 'off'}"
           "   (conversations.replies when the ledger has no root row --")
@@ -312,8 +321,13 @@ def context_section(db, cfg):
               f"({int(last.get('context_chars') or 0)} of them context), "
               f"{int(last.get('thread_msgs') or 0)} thread message(s), "
               f"{int(last.get('fetches') or 0)} Slack call(s)")
-        print(f"                      sections: "
-              f"{', '.join(last.get('sections') or ['(none)'])}")
+        chars = last.get("section_chars") or {}
+        sections = last.get("sections") or []
+        rendered = ", ".join(
+            f"{name} {int(chars[name])}ch" if name in chars else name
+            for name in sections
+        ) or "(none)"
+        print(f"                      sections: {rendered}")
         if last.get("notes"):
             print(f"                      degraded: {', '.join(last['notes'])}")
         print("                      (counts only -- no fetched text is stored"

@@ -142,6 +142,16 @@ Honest scoping of that claim, because "CLOSED" is doing a lot of work in a table
      fetched and the root-is-bot loop-safety rung re-established from Slack itself. If it
      cannot be, the nominee is **dropped, not judged** (`declined-root-unknown`, which
      consumes no watermark, so the sweep retries).
+   - **A thread with a HOLE is still judged with the hole.** The backfill has exactly one
+     trigger: a **missing root row**. A thread whose root we recorded but whose middle
+     messages we never saw — gateway downtime, senders the adapter filtered before
+     `SLACK_ALLOW_ALL_USERS`, replies pruned under a live root — is not repaired, so the
+     judge can still call a thread unanswered that was answered by a message the ledger
+     never held. A second trigger for it was written (`root_ts < channel_first_ts`) and
+     **was unreachable**: `channel_first_ts` is `MIN(ts)` over the same channel's rows and
+     a rooted candidate's own root row is one of them. Removed on 2026-08-12 rather than
+     left to imply a repair that never ran; closing it for real costs a
+     `conversations.replies` on every judgment, which is an operator's money decision.
    - **Not included, deliberately:** files/attachments (unbounded bytes, classic injection
      vector, `files:read` *is* granted), real names or Slack user ids (we pseudonymise to
      `A1`/`A2`; an id in a prompt invites an @-mention, and `sanitize_nudge` refuses every

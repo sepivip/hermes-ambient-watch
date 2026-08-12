@@ -594,8 +594,12 @@ class ArrivalRuntime:
             return "throttled"
 
         # 13.5. CONTEXT FIDELITY, off the loop thread like every other blocking
-        #       thing here (<=2 Slack GETs plus two narrow ledger reads, bounded
-        #       by context_total_timeout_seconds). It sits BELOW buckets.take so
+        #       thing here (0 GETs in steady state, 2 typically, 4 at absolute
+        #       worst — replies + history + a cold info + pins if an operator
+        #       enabled them — plus a few narrow ledger reads, and the whole
+        #       enrichment shares ONE context_total_timeout_seconds budget, so
+        #       the latency bound does not grow with the count. Every mute lookup
+        #       is an indexed primary-key hit.) It sits BELOW buckets.take so
         #       at most one enrichment exists per judgment — that is what makes
         #       Slack call volume inherit the buckets and the USD caps rather
         #       than following channel traffic. A rootless thread whose root

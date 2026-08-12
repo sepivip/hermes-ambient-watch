@@ -44,6 +44,14 @@ category the 2026-08-11 incident came from. The fetch is cheap enough that persi
 nothing. This is why "nothing new is written to disk" is architectural here rather than
 "sanitized before storage", and why a test diffs the whole data directory.
 
+**Two cache scopes, and the split is load-bearing.** Channel identity (and pins) use the
+6h TTL: a topic does not change per message. Fetched channel ACTIVITY uses a per-enrichment
+"batch" scope and is never reused by the next judgment. The arrival runtime holds one cache
+for the whole gateway process, so a no-expiry entry would freeze the channel window at
+whatever it was the first time the process judged anything — and freeze it in exactly the
+wrong direction, since the in-channel answer this section exists to notice usually arrives
+*after* the first fetch. Caught on review, then pinned by a test and a mutation.
+
 **Thread replies are deliberately NOT cached across judgments**, unlike channel identity
 (6 h TTL). A thread's replies changing is the entire reason it gets re-judged, so a cached
 copy would make the second verdict reason about a stale thread. One fetch per *judgment* is
@@ -74,7 +82,7 @@ user-only `search:read` scope, so a bot token structurally cannot have it — an
 ingest text from channels nobody opted into, defeating the watched-channel perimeter.
 PARITY gap 5 stays open with that reason rather than as a TODO.
 
-**Mutation-verified, not just tested.** Nine load-bearing lines were individually broken to
+**Mutation-verified, not just tested.** Ten load-bearing lines were individually broken to
 confirm a test fails. One survived first time: deleting `neutralize()` from the fetched
 topic still passed, because the join-level `_INJECTION` check redacted the whole block. The
 test was rewritten with a benign-but-structure-forging probe so it isolates the per-field
