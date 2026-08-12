@@ -35,7 +35,7 @@ from aw_escalate import EscalationResult, check_escalation
 T0 = 1754900000.0
 NUDGE_TS = "1754900500.111111"   # the ts Slack gave OUR nudge message
 THREAD = f"{T0:.6f}"
-REACTOR = "U04MC8YUE3T"
+REACTOR = "U0HUMAN001"
 
 
 def _reaction_event(
