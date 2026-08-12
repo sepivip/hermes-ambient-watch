@@ -5,6 +5,45 @@ later change. Newest first.
 
 ---
 
+## 2026-08-12 — The USD figures are MODELLED, not billed. Say so.
+
+`auth.json` shows the only configured provider is `openai-codex` with
+`auth_mode: chatgpt` — a ChatGPT **subscription** OAuth, not a metered API key.
+There is no second provider with credentials.
+
+So `aw_budget`'s dollars are computed from our own price table
+(`aw_budget._DEFAULT_PRICE`, `cfg.prices`) applied to reported token counts.
+Under subscription auth **no per-token charge occurs**; the real constraint is
+plan quota and provider rate limits. "$0.0045 per decision" is a *modelled cost*,
+not money observed leaving an account.
+
+**This does not make the budget useless** — it is still the throughput governor
+that decides when to decline, and it is the only limiter that exists. It just
+means the unit is notional here, and it would become literal the moment an API
+key is configured for a metered provider.
+
+**Consequence for public claims:** anything we publish must say "roughly half a
+cent of modelled usage" or similar, never "costs half a cent". I had written the
+stronger claim in `SOCIAL.md` before checking `auth_mode`; corrected. This is the
+fourth time in this project that a confident claim about the environment turned
+out to need verifying against the environment itself.
+
+---
+
+## 2026-08-12 — Judge pinned to the smallest available model
+
+`auxiliary.ambient_watch_judge` → `openai-codex / gpt-5.4-mini` (the smallest of
+the nine models this provider exposes). Judgment now runs on every eligible
+message rather than 96 times a day, and channel context will grow the prompt, so
+it should not sit on the flagship.
+
+Safe to try because the judge is fail-closed: a model that cannot hold the JSON
+schema yields silence, not nonsense — a bad pin shows up as "ambient went quiet",
+never as a bad post. Verified live: `gpt-5.4-mini` returned a well-formed verdict
+at `conf=0.98`. Revert to `gpt-5.6-sol` if verdict quality drops.
+
+---
+
 ## 2026-08-12 — Mirror Claude Tag's thread window exactly
 
 **Decision (operator).** The judge's thread context follows Anthropic's spec
