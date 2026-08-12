@@ -293,6 +293,30 @@ def build_context_block(sections, budget: int = CTX_TOTAL_CHARS) -> str:
     return f"{DELIM_OPEN}\n{view}\n{DELIM_CLOSE}"
 
 
+#: Messages taken from the START of a truncated thread: the root plus the two
+#: oldest replies. Small on purpose — recency decides more of the verdict — but
+#: never zero, because a thread without its opening reads as fragments.
+_WINDOW_HEAD = 3
+
+
+def _gap_row(omitted: int) -> dict:
+    """A marker for messages the window dropped.
+
+    Without it the view runs straight from the root to the tail and the judge
+    cannot tell a quiet thread from a truncated one — "nobody said anything" and
+    "we did not show you what they said" are different facts, and only one of
+    them means the thread is stalled. The text is OUR vocabulary, so no channel
+    string can impersonate it.
+    """
+    return {
+        "ts": None,
+        "author": None,
+        "is_bot": 0,
+        "text": f"({omitted} earlier message{'s' if omitted != 1 else ''} omitted)",
+        "_marker": True,
+    }
+
+
 def build_judge_view(
     messages,
     max_messages: int = JUDGE_MAX_MESSAGES,
@@ -315,13 +339,31 @@ def build_judge_view(
     if not rows:
         return f"{DELIM_OPEN}{EMPTY}{DELIM_CLOSE}"
 
-    # Root plus the most recent tail: the two ends of a thread are what a
-    # judgment actually needs. DELIBERATE DIVERGENCE from Claude Tag's
-    # oldest-first 50-message window — see PARITY.md: their question is "what is
-    # this thread about", ours is "has this already resolved", and the answer to
-    # ours lives in the last few messages ("never mind, found it").
+    # BOTH ENDS: the root, the oldest few replies, then as much of the tail as
+    # the budget allows, with the gap marked.
+    #
+    # An earlier version took root + newest only, justified by the claim that
+    # Claude Tag is always tagged (so answers "what is this thread about") while
+    # we never are (so answer "has this resolved"). That claim is FALSE and the
+    # divergence built on it is withdrawn — Anthropic's docs: "Claude replies
+    # without an @-mention ... to channel messages it judges warrant a reply ...
+    # the @-mention is how you guarantee a response, not a requirement for one."
+    # Claude Tag answers unprompted too, and still reads oldest-first.
+    #
+    # We also do not copy "oldest 50" verbatim: that window is documented for the
+    # mid-thread MENTION case, the docs do not state what the unprompted path
+    # reads, and Claude Tag's ambient path additionally reads channel history and
+    # searches the workspace — so no documented ambient rule exists to mirror.
+    #
+    # What justifies keeping the tail is a property of OUR design rather than a
+    # different question: we get exactly ONE post per thread, ever, so a late
+    # "never mind, found it" is the most expensive thing to miss. Hence both ends,
+    # weighted toward recency.
     if len(rows) > max_messages:
-        rows = rows[:1] + rows[-(max_messages - 1):]
+        head = rows[:_WINDOW_HEAD]
+        tail = rows[-(max_messages - _WINDOW_HEAD):]
+        omitted = len(rows) - len(head) - len(tail)
+        rows = head + ([_gap_row(omitted)] if omitted > 0 else []) + tail
 
     base = None
     for row in rows:
@@ -354,7 +396,14 @@ def build_judge_view(
             text, who, when = row, "A1", ""
         body = neutralize(text, JUDGE_MAX_MESSAGE_CHARS)
         if body:
-            lines.append(f"{who}{when}: {body}{_acks(row)}")
+            # Our own truncation marker renders bare. With a speaker prefix it
+            # read as "A?: (2 earlier messages omitted)", i.e. as something a
+            # participant said — the one line in the view that must not look
+            # like channel content.
+            if isinstance(row, dict) and row.get("_marker"):
+                lines.append(body)
+            else:
+                lines.append(f"{who}{when}: {body}{_acks(row)}")
 
     view = "\n".join(lines) if lines else EMPTY
     if len(view) > max_view_chars:
