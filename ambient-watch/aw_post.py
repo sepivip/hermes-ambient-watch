@@ -259,6 +259,11 @@ def post_nudge(cfg, store, candidate, text: str, transport=None) -> PostResult:
         )
         return fail(f"post-failed:{resp.get('error')}")
 
-    store.record_intervention(channel, thread_ts, kind=candidate.kind)
+    # Keep the ts Slack gave OUR message: it is the anchor reaction-gated
+    # escalation compares against, so a reaction only counts as a human
+    # invocation when it lands on something we actually posted.
+    store.record_intervention(
+        channel, thread_ts, kind=candidate.kind, nudge_ts=resp.get("ts")
+    )
     logger.info("ambient-watch: nudged %s/%s [%s]", channel, thread_ts, candidate.kind)
     return PostResult(True, "posted", channel, thread_ts)

@@ -38,6 +38,11 @@ LEGACY_KEYS = (
 # Config keys copied verbatim onto the dataclass when present.
 _PASSTHROUGH_KEYS = (
     "min_age_minutes",
+    "max_age_minutes",
+    "escalation_enabled",
+    "escalation_channels",
+    "escalation_emoji",
+    "escalation_max_per_day",
     "arrival_enabled",
     "arrival_debounce_seconds",
     "arrival_max_wait_seconds",
@@ -98,6 +103,11 @@ class AmbientConfig:
     # [min_age_minutes, inf). load_config() enforces that by clamping
     # arrival_max_wait_seconds strictly below min_age_minutes*60.
     min_age_minutes: int = 45
+    # Staleness ceiling, measured from LAST ACTIVITY (0 = no ceiling). Past
+    # this a thread is retired rather than answered: the conversation has moved
+    # on, and without it a mode flip or a cleared marker flushes a backlog of
+    # day-old questions into the channel at once. Found live 2026-08-12.
+    max_age_minutes: int = 12 * 60
     # Throughput cap: nominees handed to the judge per sweep (also the
     # Claude-Tag-style rate limit — at most one candidate per channel).
     candidates_per_run: int = 3
@@ -139,6 +149,21 @@ class AmbientConfig:
     quiet_tz: str = "UTC"
 
     retention_days: int = 14
+
+    # -- reaction-gated escalation (see aw_escalate) -----------------------
+    # OFF by default and fail-closed in three independent places: this flag,
+    # a non-empty escalation_channels that must be a subset of `channels`, and
+    # slack.reaction_triggers in Hermes' own config.yaml. Escalation hands a
+    # thread to a FULL-TOOLSET Hermes session, so it requires a human to add a
+    # reaction to one of our own nudges — that click is the security control,
+    # and it is what stands in for the sandbox / spend-decline / egress-proxy /
+    # per-channel-bundle layers Claude Tag has and we do not.
+    escalation_enabled: bool = False
+    escalation_channels: set = field(default_factory=set)
+    escalation_emoji: set = field(default_factory=lambda: {"mag"})
+    # aw_budget structurally cannot see what an escalated session spends (it
+    # runs in another process), so this counter is the ONLY limiter.
+    escalation_max_per_day: int = 1
 
     # -- judgment ---------------------------------------------------------
     judge_confidence_threshold: float = 0.7

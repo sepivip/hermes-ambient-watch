@@ -24,6 +24,7 @@ from pathlib import Path
 
 from .aw_arrival import ArrivalRuntime
 from .aw_config import hermes_home, load_config
+from .aw_escalate import check_escalation
 from .aw_guard import check_tool_call, data_dir_jail, looks_sensitive
 from .aw_judge import AUX_TASK
 from .aw_recorder import Decision, decide
@@ -211,6 +212,26 @@ def register(ctx):
     def on_pre_gateway_dispatch(event=None, **kwargs):
         if event is None:
             return None
+
+        # Reaction-gated escalation, checked FIRST because it is the only path
+        # that deliberately hands a thread to a full-toolset Hermes session.
+        # It fires only for a human reaction added to one of OUR OWN nudges, in
+        # an opted-in channel, in live mode, under the daily cap — see
+        # aw_escalate for the full ladder and why the human click is the
+        # control. Any error here means no escalation, never an escalation.
+        try:
+            esc = check_escalation(event, cfg, store)
+            if esc.escalate:
+                store.record_escalation(esc.channel, esc.thread_ts, esc.reactor)
+                logger.warning(
+                    "ambient-watch: ESCALATING %s/%s to a full-toolset session, "
+                    "invoked by %s",
+                    esc.channel, esc.thread_ts, esc.reactor,
+                )
+                return {"action": "rewrite", "text": esc.prompt}
+        except Exception:
+            logger.exception("ambient-watch: escalation check failed — not escalating")
+
         verdict = decide(event, cfg, store)
         if isinstance(verdict, tuple):
             # (RECORD_REWRITE, replacement_text) — an in-channel control

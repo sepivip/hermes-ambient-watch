@@ -175,6 +175,16 @@ def find_candidates(
             last_activity = max(float(m["ts"]) for m in msgs)
             if (now - last_activity) < age_floor:
                 continue  # still moving — leave it alone
+            # Staleness ceiling. Found live 2026-08-12: a question asked at
+            # 18:15 was answered at 10:27 the next morning, because flipping
+            # mode to live made every shadow-only thread eligible at once and
+            # nothing capped age. Answering a 16-hour-old question unprompted
+            # is noise, and it arrives as a BURST on every mode flip or marker
+            # clear. Measured from last activity, not the root, so a long
+            # thread people are still talking in is never wrongly retired.
+            max_age = int(getattr(cfg, "max_age_minutes", 0) or 0)
+            if max_age > 0 and (now - last_activity) > max_age * 60:
+                continue  # the conversation has moved on
             if not store.needs_judgment(
                 channel, root_ts, last_activity, cfg.judge_max_rejudge
             ):

@@ -120,9 +120,21 @@ def test_a_declined_candidate_is_still_there_when_the_cap_resets(cfg, store):
     assert "DECLINED" in out and judge.calls == []
     assert store.judgment(WATCHED, f"{T0:.6f}")["verdict"] == "declined-exceeded"
 
-    # A day later the spend window has rolled; the thread is still unanswered.
-    later = NOW + DAY + 60
-    assert budget.decision(WATCHED, now=later) == "ok"
+    # Once there is headroom again the thread is judged — proving the decline
+    # did not consume the re-judge watermark.
+    #
+    # Checked WITHIN the staleness ceiling rather than "a day later" as this
+    # test originally did. The two interact deliberately: the spend window is
+    # daily but max_age_minutes defaults to 12h, so a thread declined for
+    # budget and left for a full day is now retired by AGE, not resurrected.
+    # That is the intended trade — answering a day-old question is the exact
+    # noise the ceiling exists to stop — and the decline is still visible in
+    # the ops digest and the judgments table, so it fails loudly rather than
+    # silently.
+    cfg.daily_usd_global = 100.0
+    cfg.daily_usd_per_channel = 100.0
+    later = NOW + 2 * 3600
+    assert Budget(store, cfg.budget_cfg()).decision(WATCHED, now=later) == "ok"
     out = run_gate(cfg, store, now=later, judge_fn=judge, transport=FakeTransport())
     assert len(judge.calls) == 1, "the declined thread was never judged"
     assert "WOULD HAVE POSTED" in out

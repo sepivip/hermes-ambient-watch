@@ -73,6 +73,17 @@ CREATE TABLE IF NOT EXISTS shadow_seen (
 -- the judge declined is not judged again until a NEW human message arrives,
 -- so a thread cannot cost repeated LLM calls merely by continuing to exist.
 -- `judge_count` bounds even that (cfg.judge_max_rejudge).
+-- Reaction-gated escalation audit. One row per thread handed to a
+-- full-toolset Hermes session, recording WHICH HUMAN invoked it. The human
+-- reaction is the entire security control, so who clicked is the single most
+-- important fact to keep.
+CREATE TABLE IF NOT EXISTS escalations (
+    channel    TEXT NOT NULL,
+    thread_ts  TEXT NOT NULL,
+    reactor    TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (channel, thread_ts)
+);
 CREATE TABLE IF NOT EXISTS judgments (
     channel            TEXT NOT NULL,
     thread_ts          TEXT NOT NULL,
@@ -100,7 +111,25 @@ class AmbientStore:
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA busy_timeout=5000")
             self._db.executescript(_SCHEMA)
+            self._migrate()
             self._db.commit()
+
+    def _migrate(self):
+        """Additive column migrations for already-deployed databases.
+
+        CREATE TABLE IF NOT EXISTS never adds a column to a table that already
+        exists, so a live ambient.db keeps its original interventions schema.
+        Each step is idempotent and tolerates the column already being there.
+        """
+        for table, column, decl in (
+            ("interventions", "nudge_ts", "TEXT"),
+        ):
+            cols = {
+                r["name"]
+                for r in self._db.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if column not in cols:
+                self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def close(self):
         with self._lock:
@@ -178,13 +207,65 @@ class AmbientStore:
             return cur.fetchone() is not None
 
     # -- interventions ----------------------------------------------------
-    def record_intervention(self, channel, thread_ts, kind, now=None):
+    def record_intervention(self, channel, thread_ts, kind, now=None, nudge_ts=None):
+        """Record a posted nudge.
+
+        ``nudge_ts`` is the ts Slack assigned to OUR message. It is the anchor
+        reaction-gated escalation compares against: a reaction only counts as a
+        human invocation when it lands on a message we actually posted, so
+        "some message in this thread" is not good enough.
+        """
         with self._lock, self._db:
             self._db.execute(
-                "INSERT INTO interventions (channel, thread_ts, kind, created_at)"
-                " VALUES (?,?,?,?)",
-                (channel, thread_ts, kind, now if now is not None else time.time()),
+                "INSERT INTO interventions (channel, thread_ts, kind, created_at, nudge_ts)"
+                " VALUES (?,?,?,?,?)",
+                (channel, thread_ts, kind,
+                 now if now is not None else time.time(), nudge_ts),
             )
+
+    def nudge_ts_matches(self, channel, thread_ts, ts) -> bool:
+        """True when *ts* is the ts of a nudge WE posted in this thread."""
+        if not ts:
+            return False
+        with self._lock:
+            cur = self._db.execute(
+                "SELECT 1 FROM interventions"
+                " WHERE channel=? AND thread_ts=? AND nudge_ts=? LIMIT 1",
+                (channel, thread_ts, str(ts)),
+            )
+            return cur.fetchone() is not None
+
+    # -- escalation ledger (reaction-gated; see aw_escalate) ---------------
+    def record_escalation(self, channel, thread_ts, reactor, now=None):
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT OR IGNORE INTO escalations"
+                " (channel, thread_ts, reactor, created_at) VALUES (?,?,?,?)",
+                (channel, thread_ts, reactor,
+                 now if now is not None else time.time()),
+            )
+
+    def has_escalation(self, channel, thread_ts) -> bool:
+        with self._lock:
+            cur = self._db.execute(
+                "SELECT 1 FROM escalations WHERE channel=? AND thread_ts=?",
+                (channel, thread_ts),
+            )
+            return cur.fetchone() is not None
+
+    def escalations_since(self, since) -> int:
+        with self._lock:
+            cur = self._db.execute(
+                "SELECT COUNT(*) c FROM escalations WHERE created_at>=?", (since,)
+            )
+            return cur.fetchone()["c"]
+
+    def recent_escalations(self, limit=10):
+        with self._lock:
+            cur = self._db.execute(
+                "SELECT * FROM escalations ORDER BY created_at DESC LIMIT ?", (limit,)
+            )
+            return [dict(r) for r in cur.fetchall()]
 
     def record_engagement(self, channel, thread_ts):
         with self._lock, self._db:
