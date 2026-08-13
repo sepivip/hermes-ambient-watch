@@ -58,6 +58,7 @@ class Outcome:
     reason: str
     nudge: str
     weight: str = "normal"
+    boundary: bool = False
     error: str = ""
 
     @property
@@ -78,12 +79,29 @@ class Report:
     seconds: float = 0.0
 
     @property
+    def scored(self):
+        """Cases whose label is decidable.
+
+        `boundary` cases sit ON the decision line and have been observed
+        flipping across runs with the SAME model and prompt — so they measure
+        non-determinism, not quality, and averaging a coin-flip into the score
+        makes the score noisier without making it truer. They are still RUN and
+        still REPORTED, because watching which way the boundary drifts is worth
+        more than a tidier number; they just do not count.
+        """
+        return [o for o in self.outcomes if not o.boundary]
+
+    @property
     def passed(self):
-        return [o for o in self.outcomes if o.ok]
+        return [o for o in self.scored if o.ok]
 
     @property
     def failed(self):
-        return [o for o in self.outcomes if not o.ok]
+        return [o for o in self.scored if not o.ok]
+
+    @property
+    def boundary_outcomes(self):
+        return [o for o in self.outcomes if o.boundary]
 
     @property
     def critical_failures(self):
@@ -91,7 +109,7 @@ class Report:
 
     @property
     def score(self) -> float:
-        return len(self.passed) / len(self.outcomes) if self.outcomes else 0.0
+        return len(self.passed) / len(self.scored) if self.scored else 0.0
 
     def confusion(self):
         """(false_silence, false_speech) — the two failures, named by their cost.
@@ -204,6 +222,7 @@ def run(cases, model=None, provider=None, context=True, dry_run=False) -> Report
                 reason=(v.reason if v else result.error or "no verdict"),
                 nudge=(v.nudge if v else ""),
                 weight=case.get("weight", "normal"),
+                boundary=bool(case.get("boundary")),
                 error=result.error,
             )
         )
@@ -222,12 +241,17 @@ def show(rep: Report, usd_per_mtok=(5.0, 15.0)):
         rep.completion_tokens / 1e6
     ) * usd_per_mtok[1]
     print("\n" + "=" * 72)
-    print(f"MODEL {rep.model}    score {len(rep.passed)}/{len(rep.outcomes)} "
+    print(f"MODEL {rep.model}    score {len(rep.passed)}/{len(rep.scored)} "
           f"({rep.score:.0%})    {rep.seconds:.0f}s    ~${cost:.4f} modelled")
     print(f"  false silence (expected post, stayed quiet) : {fs}   <- unhelpful")
     print(f"  false speech  (expected skip, posted)       : {fsp}   <- annoying, spends the one post")
     if rep.critical_failures:
         print(f"  !! CRITICAL failures: {[o.case_id for o in rep.critical_failures]}")
+    for o in rep.boundary_outcomes:
+        mark = "as labelled" if o.ok else "the other way"
+        print(f"  boundary {o.case_id}: went {o.got} ({mark}) @ {o.confidence:.2f}"
+              f" — not scored")
+        print(f"       reason: {o.reason}")
     for o in rep.failed:
         print(f"\n  FAIL {o.case_id}  (expected {o.expect}, got {o.got} @ {o.confidence:.2f})")
         print(f"       reason: {o.reason}")

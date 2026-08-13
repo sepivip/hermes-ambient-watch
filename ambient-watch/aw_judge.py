@@ -107,8 +107,12 @@ fence, matching exactly this shape:
 "nudge": "<the one sentence to post, or empty string when should_post is \
 false>"}]}
 
-Return one verdict per thread, using the ids exactly as given. confidence is \
-your confidence that posting is the right call.
+Return one verdict per thread, using the ids exactly as given.
+
+confidence is ALWAYS your probability that POSTING is the right call, on one \
+scale, never your confidence in the verdict you chose. So a should_post=false \
+verdict you are sure about carries a LOW confidence, near 0.0 — not a high one. \
+A borderline thread carries something near 0.5 whichever way you decided.
 """
 
 
