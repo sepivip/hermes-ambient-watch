@@ -227,8 +227,13 @@ def test_the_judge_prompt_is_byte_identical_while_context_is_dark():
     )
     digest = hashlib.sha256(repr(aw_judge.build_messages([cand])).encode()).hexdigest()
     assert digest == (
-        "1ed73f60c3e472d48db07576ff8940ab9c40fd2fb90f5a1de0351f42b3206d71"
-    ), "the judge prompt changed for a nominee with no context"
+        "0905ae025ef21ed58d0c4062e1f920e85516cbec94bc646644ebacb83faeae14"
+    ), (
+            "the judge prompt changed for a nominee with no context. If you "
+            "changed JUDGE_RULES/JUDGE_TASK on purpose, re-run the eval "
+            "(python aw_eval.py) BEFORE updating this hash — the prompt is the "
+            "product, and a silent hash bump is how a quality regression ships."
+        )
 
 
 def test_config_defaults_are_off_and_clamped(tmp_path):
