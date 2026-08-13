@@ -6,3 +6,4 @@ __pycache__/
 *.db
 candidates.json
 evals/baseline-*.json
+SOCIAL.md
