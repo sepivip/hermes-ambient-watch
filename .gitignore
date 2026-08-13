@@ -5,3 +5,4 @@ __pycache__/
 .remember/
 *.db
 candidates.json
+evals/baseline-*.json
