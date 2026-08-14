@@ -251,3 +251,54 @@ the controls Claude Tag itself has: once per thread, self-quiet after N ignored
 nudges, quiet hours, a kill switch, and the spend limit — plus a staleness
 ceiling, which Claude Tag does not need because its routines only fire on
 change.
+
+## Channel sleep counts SKIP VERDICTS, not ignored nudges (2026-08-14)
+
+Copied from Claude Tag's 2026-08-13 update ("In a channel where, message after
+message, Claude keeps concluding it has nothing to add, it goes to sleep. A
+@-mention wakes it instantly").
+
+We already had `self_quiet_after_ignored`, and it is NOT the same control.
+Self-quiet counts nudges nobody engaged with, so it requires us to have POSTED.
+In a channel where the judge always declines we never post, self-quiet never
+arms, and we pay for a judge call on every qualifying message forever. Sleep
+counts consecutive skip VERDICTS and is checked in the prefilter, before
+`TokenBuckets.take` and before the budget — so a dead channel costs nothing.
+
+WAKING IS THE HALF THAT FIXED AN EXISTING BUG. Nothing re-armed self-quiet: a
+channel that went quiet stayed quiet through an explicit @-mention. Both
+counters now reset on a mention, via a `channel_wake` watermark rather than a
+delete, so the judgment history other queries rely on is preserved.
+
+## Standing instructions are OPERATOR-SET, not settable from Slack (2026-08-14)
+
+Claude Tag lets any channel member set them conversationally ("Never respond
+here unless someone tags you"). We deliberately do not. With
+`SLACK_ALLOW_ALL_USERS=true`, "any member" means anyone in the workspace can
+rewrite the text that steers the judge — attacker-writable content in the
+TRUSTED half of the prompt, which is the exact category L1 exists to keep out.
+Config-only in v1; in-channel setting can come later behind an allowlist.
+
+The instruction is trusted, so it does NOT go through `neutralize` (which would
+redact it — an instruction is instruction-shaped by definition). It gets
+`clean_trusted`: flattened, delimiter-safe, capped at 400 chars, placed as a
+labelled header OUTSIDE the untrusted delimiters.
+
+## Our only context test was confounded and measured nothing (2026-08-14)
+
+`channel-topic-should-suppress` was cited (by me, on 2026-08-13) as proof that
+channel context worked: it declined at 0.01 "solely because" the topic said
+incident-comms-only. That was wrong. Re-run with `--no-context` it declines
+identically, because "the biggest instance type available right now" is
+unanswerable from the thread whatever channel it is in. The topic never did any
+work, and the eval scored 15/15 both with and without context.
+
+Replaced by `answerable-but-wrong-room`: "what's the capital of Australia
+again?" in a SEV-1 war room. Thread-only it is the same shape as a case we
+answer at 0.98, so the channel is the ONLY thing that can produce a skip.
+Measured: skip @0.02 with context, post @0.99 without. That 0.02-vs-0.99 swing
+is our equivalent of Anthropic's "roughly 30% better" claim, and it is the
+first honest measurement we have had that context does anything at all.
+
+THE GENERAL RULE, now in the case file: a context case must be one the judge
+would POST on without context. Otherwise it measures nothing and reports success.

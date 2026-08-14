@@ -124,6 +124,49 @@ def _bar(spent: float, cap: float) -> str:
     return f"${spent:.4f} / ${cap:.2f}  ({ratio:.0%}){flag}"
 
 
+def sleep_section(db, cfg):
+    """Is a channel asleep, and why?
+
+    Exists because a sleeping channel and a broken plugin look IDENTICAL from
+    Slack: both are silence. Without this an operator would debug a working
+    feature. Prints the streak even when awake, so you can see it coming.
+    """
+    threshold = int(cfg.get("sleep_after_skips", 6) or 0)
+    channels = cfg.get("channels") or []
+    if not threshold or not channels:
+        return
+    # Gather BEFORE printing the header: on a pre-migration db (channel_wake
+    # arrives when the store next opens) an early return after the header left
+    # a heading with no rows, which reads as "all channels fine".
+    lines = []
+    for channel in channels:
+        try:
+            row = db.execute(
+                "SELECT woke_at FROM channel_wake WHERE channel=?", (channel,)
+            ).fetchone()
+            woke = float(row[0]) if row else 0.0
+            verdicts = [
+                r[0] for r in db.execute(
+                    "SELECT verdict FROM judgments WHERE channel=? AND updated_at>?"
+                    " ORDER BY updated_at DESC LIMIT ?",
+                    (channel, woke, threshold),
+                ).fetchall()
+            ]
+        except sqlite3.OperationalError:
+            lines.append("  (channel_wake table not created yet -- restart the gateway)")
+            break
+        streak = 0
+        for v in verdicts:
+            if v != "skip":
+                break
+            streak += 1
+        asleep = len(verdicts) >= threshold and streak >= threshold
+        state = "ASLEEP -- @-mention the bot to wake it" if asleep else "awake"
+        lines.append(f"  {channel}: {state}  (skip streak {streak}/{threshold})")
+    print("\nCHANNEL SLEEP (consecutive skips -> stop paying to judge; a mention wakes it)")
+    print("\n".join(lines))
+
+
 def budget_section(db, cfg):
     print("\nSPEND (the limiter -- there are no cooldowns or daily nudge caps)")
     now = time.time()
@@ -386,6 +429,7 @@ def status():
     row = db.execute("SELECT value FROM flags WHERE key='kill_switch'").fetchone()
     print(f"  kill switch       : {'ON (ambient halted)' if row and row['value']=='1' else 'off'}")
 
+    sleep_section(db, cfg)
     budget_section(db, cfg)
     arrival_section(db, cfg)
     context_section(db, cfg)

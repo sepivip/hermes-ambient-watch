@@ -260,7 +260,16 @@ def nominee_id(index: int) -> str:
     return f"n{index + 1}"
 
 
-def build_nominee_block(index: int, candidate) -> str:
+def _standing_instruction(candidate, cfg) -> str:
+    if cfg is None:
+        return ""
+    instructions = getattr(cfg, "standing_instructions", None) or {}
+    if not isinstance(instructions, dict):
+        return ""
+    return aw_sanitize.clean_trusted(instructions.get(candidate.channel, ""))
+
+
+def build_nominee_block(index: int, candidate, cfg=None) -> str:
     """One nominee as prompt data. Carries NO Slack ids on purpose: an id in
     the prompt is an invitation to @-mention someone.
 
@@ -269,12 +278,20 @@ def build_nominee_block(index: int, candidate) -> str:
     nominee's trusted header fields (participants, quiet-for, context:) can
     never be confused with channel text. The ``context:`` note is OUR OWN fixed
     vocabulary, which is why it sits outside the delimiters.
+
+    A STANDING INSTRUCTION (operator-set, per channel) is trusted guidance and
+    is placed as a labelled header BEFORE the thread, outside the delimiters, so
+    the model reads it as a rule rather than as channel content.
     """
     parts = [
         f"THREAD {nominee_id(index)}",
         f"participants: {getattr(candidate, 'human_participants', 1)} human(s)",
         f"quiet for: {int(getattr(candidate, 'idle_minutes', 0))} minutes",
     ]
+    instruction = _standing_instruction(candidate, cfg)
+    if instruction:
+        parts.append(f"STANDING INSTRUCTIONS for this channel (from the operator, "
+                     f"follow them): {instruction}")
     note = getattr(candidate, "context_note", "") or ""
     block = getattr(candidate, "context_block", "") or ""
     if note:
@@ -287,10 +304,10 @@ def build_nominee_block(index: int, candidate) -> str:
     return "\n".join(parts)
 
 
-def build_messages(nominees) -> list:
+def build_messages(nominees, cfg=None) -> list:
     nominees = list(nominees)
     blocks = "\n\n".join(
-        build_nominee_block(i, c) for i, c in enumerate(nominees)
+        build_nominee_block(i, c, cfg) for i, c in enumerate(nominees)
     )
     # A NOTE COUNTS, NOT ONLY A BLOCK. When every section failed to fetch, the
     # nominee carries "context: channel history unavailable" and NO block — and
@@ -518,7 +535,7 @@ def judge(nominees, cfg, llm=None) -> JudgeResult:
         return JudgeResult()
     call = llm or hermes_llm
     try:
-        response = call(build_messages(nominees), cfg)
+        response = call(build_messages(nominees, cfg), cfg)
     except Exception as exc:  # noqa: BLE001 — never post because of a failure
         return result_from_failure(exc, nominees, cfg)
     return _result_from_response(response, nominees)
@@ -542,7 +559,7 @@ async def ajudge(nominees, cfg, allm=None) -> JudgeResult:
         return JudgeResult()
     call = allm or hermes_allm
     try:
-        response = await call(build_messages(nominees), cfg)
+        response = await call(build_messages(nominees, cfg), cfg)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 — never post because of a failure

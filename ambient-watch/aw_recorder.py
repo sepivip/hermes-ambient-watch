@@ -169,6 +169,10 @@ def decide(event, cfg, store) -> Decision:
 
         if mention and not is_bot:
             store.mark_engaged(channel, root)
+            # "A @-mention wakes it instantly." Reset channel sleep and
+            # self-quiet: someone explicitly asked for the bot, so the channel
+            # is not one it should be ignoring.
+            store.wake_channel(channel)
 
         store.record_message(
             channel=channel,

@@ -87,6 +87,7 @@ JUDGE_MAX_VIEW_CHARS = 2400
 CTX_THREAD_MESSAGES = 16      # root + newest 15 — see build_judge_view
 CTX_THREAD_VIEW_CHARS = 3000  # ~190 chars/message: about two readable sentences
 CTX_TOPIC_CHARS = 200         # channel name + topic + purpose, together
+STANDING_INSTRUCTION_CHARS = 400   # operator-set per-channel steer, trusted
 CTX_TOPIC_FIELD_CHARS = 120   # each of topic/purpose on its own
 CTX_CHANNEL_MSGS = 6
 CTX_CHANNEL_MSG_CHARS = 160
@@ -234,6 +235,21 @@ def _acks(row) -> str:
         return ""
     keep = [n for n in ACK_REACTIONS if n in names]
     return f" [ack: {' '.join(keep)}]" if keep else ""
+
+
+def clean_trusted(text, max_chars: int = STANDING_INSTRUCTION_CHARS) -> str:
+    """Prepare OPERATOR-authored text (a standing instruction) for the prompt.
+
+    Trusted, so unlike ``neutralize`` it does NOT redact instruction-shaped
+    content — a standing instruction is instruction-shaped by definition. It is
+    only flattened to one line, stripped of characters that could forge our own
+    delimiters, and length-capped. Returns "" for a non-string or empty input,
+    so a mis-typed config value is ignored rather than fatal.
+    """
+    if not isinstance(text, str):
+        return ""
+    s = _clean(text)
+    return s[:max_chars].rstrip() if s else ""
 
 
 def neutralize_lines(texts, max_chars: int = MAX_MESSAGE_CHARS, limit: int = 0):

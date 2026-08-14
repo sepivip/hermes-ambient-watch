@@ -48,6 +48,8 @@ _PASSTHROUGH_KEYS = (
     "escalation_channels",
     "escalation_emoji",
     "escalation_max_per_day",
+    "sleep_after_skips",
+    "standing_instructions",
     "arrival_enabled",
     "arrival_debounce_seconds",
     "arrival_max_wait_seconds",
@@ -215,6 +217,18 @@ class AmbientConfig:
     # aw_budget structurally cannot see what an escalated session spends (it
     # runs in another process), so this counter is the ONLY limiter.
     escalation_max_per_day: int = 1
+
+    # -- channel sleep + standing instructions (Claude Tag 2026-08-13 parity) --
+    # Sleep: after this many CONSECUTIVE skip verdicts a channel is dropped by
+    # the prefilter (before the judge is paid) until a mention wakes it. This is
+    # the money fix for a channel the judge always declines — self-quiet cannot
+    # help there because it needs us to have posted. 0 disables.
+    sleep_after_skips: int = 6
+    # Operator-set per-channel steer injected into the judge prompt as TRUSTED
+    # guidance ({channel_id: "instruction"}). NOT settable from Slack: with
+    # SLACK_ALLOW_ALL_USERS=true, in-channel setting would let anyone rewrite the
+    # judge's guidance — attacker-writable trusted text. Config-only in v1.
+    standing_instructions: dict = field(default_factory=dict)
 
     # -- judgment ---------------------------------------------------------
     judge_confidence_threshold: float = 0.7

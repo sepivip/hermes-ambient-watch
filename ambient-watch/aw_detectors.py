@@ -207,6 +207,8 @@ def find_candidates(
             continue  # someone muted the whole channel from Slack
         if store.channel_self_quieted(channel, cfg.self_quiet_after_ignored):
             continue
+        if store.channel_asleep(channel, getattr(cfg, "sleep_after_skips", 0)):
+            continue  # judge kept concluding it had nothing to add — sleep until a mention
 
         best: Candidate | None = None
         for root in _all_roots(store, cfg, channel, only_root):

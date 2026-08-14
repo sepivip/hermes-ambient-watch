@@ -241,7 +241,7 @@
       "id": "channel-topic-should-suppress",
       "expect": "skip",
       "weight": "critical",
-      "note": "CONTEXT TEST. Identical shape to a case we answer, but during an active incident an uninvited bot volunteering trivia is actively bad. Only passable if the judge actually reads the channel identity \u2014 it fails when context is off, which is the point.",
+      "note": "CONFOUNDED \u2014 kept, but it does NOT test context. Verified 2026-08-14: it skips identically with context OFF, because 'current instance availability' is unanswerable from the thread whatever the channel is. The channel topic never had to do any work. See answerable-but-wrong-room for the unconfounded version: the rule is that a context case must be one the judge would POST on without context, or it measures nothing.",
       "channel_name": "production-incidents",
       "channel_topic": "SEV tracking only. Incident comms \u2014 keep noise out.",
       "messages": [
@@ -289,6 +289,21 @@
         {
           "author": "U1",
           "text": "what does HTTP 502 actually mean? never remember the difference from 504"
+        }
+      ]
+    },
+    {
+      "id": "answerable-but-wrong-room",
+      "expect": "skip",
+      "weight": "critical",
+      "boundary": false,
+      "note": "THE REAL CONTEXT TEST. The question is plainly answerable from general knowledge \u2014 thread-only, this is the same shape as clear-factual-question, which we answer at 0.98. So the ONLY thing that can produce a skip is the channel: an active SEV-1 war room where trivia from an uninvited bot is actively harmful. Run it with --no-context and it should FLIP to post; if it does not, context is doing nothing and we should stop paying for it.",
+      "channel_name": "incident-war-room",
+      "channel_topic": "SEV-1 ACTIVE. Responders only. No side chatter \u2014 every message pages 40 people.",
+      "messages": [
+        {
+          "author": "U1",
+          "text": "wait, what's the capital of Australia again?"
         }
       ]
     }

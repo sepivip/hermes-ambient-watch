@@ -59,6 +59,14 @@ CREATE TABLE IF NOT EXISTS flags (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+-- Wake watermark for channel sleep + self-quiet. A mention writes the current
+-- time here; both "asleep" and "self-quieted" only count judgments/interventions
+-- created AFTER it. This is how "@-mention wakes it instantly" works without
+-- deleting the history that other queries rely on.
+CREATE TABLE IF NOT EXISTS channel_wake (
+    channel TEXT PRIMARY KEY,
+    woke_at REAL NOT NULL
+);
 -- Shadow-mode "already reported" ledger. Kept separate from interventions
 -- so a shadow digest never consumes a thread's real nudge budget, while
 -- still preventing the same candidate being re-digested every sweep.
@@ -433,16 +441,55 @@ class AmbientStore:
             return cur.fetchone()["m"]
 
     def channel_self_quieted(self, channel, threshold) -> bool:
+        if threshold <= 0:
+            return False
+        woke = self._woke_at(channel)
         with self._lock:
             cur = self._db.execute(
-                "SELECT engaged FROM interventions WHERE channel=?"
+                "SELECT engaged FROM interventions WHERE channel=? AND created_at>?"
                 " ORDER BY created_at DESC LIMIT ?",
-                (channel, threshold),
+                (channel, woke, threshold),
             )
             rows = cur.fetchall()
         if len(rows) < threshold:
             return False
         return all(r["engaged"] == 0 for r in rows)
+
+    # -- channel sleep (consecutive futile judgments) ---------------------
+    def _woke_at(self, channel) -> float:
+        with self._lock:
+            cur = self._db.execute(
+                "SELECT woke_at FROM channel_wake WHERE channel=?", (channel,)
+            )
+            row = cur.fetchone()
+            return row["woke_at"] if row else 0.0
+
+    def channel_asleep(self, channel, threshold) -> bool:
+        """True when the last `threshold` verdicts since the wake mark were all
+        skips. Counts SKIP VERDICTS, not ignored nudges — a channel the judge
+        keeps declining costs a call per message until it sleeps."""
+        if threshold <= 0:
+            return False
+        woke = self._woke_at(channel)
+        with self._lock:
+            cur = self._db.execute(
+                "SELECT verdict FROM judgments WHERE channel=? AND updated_at>?"
+                " ORDER BY updated_at DESC LIMIT ?",
+                (channel, woke, threshold),
+            )
+            rows = cur.fetchall()
+        if len(rows) < threshold:
+            return False
+        return all(r["verdict"] == "skip" for r in rows)
+
+    def wake_channel(self, channel, now=None):
+        """Reset sleep AND self-quiet: subsequent counts ignore everything
+        before now. Called when the bot is @-mentioned in the channel."""
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT OR REPLACE INTO channel_wake (channel, woke_at) VALUES (?,?)",
+                (channel, now if now is not None else time.time()),
+            )
 
     # -- shadow-mode dedupe -----------------------------------------------
     def mark_shadow_seen(self, channel, thread_ts, now=None):
