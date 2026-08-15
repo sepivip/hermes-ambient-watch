@@ -27,9 +27,11 @@ pytest but not hermes' deps.  Both are CPython 3.11.15, so run this repo's
 pytest with the Hermes venv's site-packages on PYTHONPATH (read-only use — it
 never writes into the real install):
 
-    PYTHONPATH="C:/Users/User/AppData/Local/hermes/hermes-agent;\
-C:/Users/User/AppData/Local/hermes/hermes-agent/venv/Lib/site-packages" \
+    PYTHONPATH="$LOCALAPPDATA/hermes/hermes-agent;\
+$LOCALAPPDATA/hermes/hermes-agent/venv/Lib/site-packages" \
     ./.venv/Scripts/python.exe -m pytest tests/test_real_gateway_dispatch.py
+
+(``HERMES_AGENT_DIR`` overrides the default install location.)
 
 Every test pins HERMES_HOME to a pytest ``tmp_path``; nothing touches the real
 Hermes home.
@@ -41,6 +43,7 @@ import asyncio
 import functools
 import importlib.util
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -50,7 +53,10 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PLUGIN_DIR = REPO_ROOT / "ambient-watch"
-HERMES_AGENT = Path(r"C:\Users\User\AppData\Local\hermes\hermes-agent")
+HERMES_AGENT = Path(
+    os.environ.get("HERMES_AGENT_DIR")
+    or (Path(os.environ.get("LOCALAPPDATA", Path.home())) / "hermes" / "hermes-agent")
+)
 
 if not HERMES_AGENT.exists():  # pragma: no cover - environment guard
     pytest.skip("real hermes-agent tree not present", allow_module_level=True)
@@ -168,9 +174,12 @@ def plugin_manager(hermes_home, monkeypatch):
     _write_config(hermes_home)
     module = _load_plugin_module()
 
-    manager = object.__new__(PluginManager)
-    manager._hooks = {}
-    manager._middleware = {}
+    # A real PluginManager, really constructed: __init__ is pure attribute
+    # setup (no discovery, no I/O, no threads), and hand-mimicking it with
+    # object.__new__ broke every time upstream grew a registry attribute
+    # (_ownership_ledger, _registration_order, ...). HERMES_HOME is already
+    # the tmp home here, so the manager scopes to the throwaway install.
+    manager = PluginManager()
 
     manifest = PluginManifest(
         name="ambient-watch",

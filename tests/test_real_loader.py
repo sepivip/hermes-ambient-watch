@@ -45,15 +45,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 PLUGIN_SRC = REPO / "ambient-watch"
 HERMES_AGENT = Path(
-    os.environ.get(
-        "HERMES_AGENT_DIR",
-        r"C:\Users\User\AppData\Local\hermes\hermes-agent",
-    )
+    os.environ.get("HERMES_AGENT_DIR")
+    or (Path(os.environ.get("LOCALAPPDATA", Path.home())) / "hermes" / "hermes-agent")
 )
 HERMES_PY = Path(
     os.environ.get("HERMES_PY", str(HERMES_AGENT / "venv" / "Scripts" / "python.exe"))
@@ -338,7 +337,17 @@ def run_scenario(*, enabled: bool = True, empty_bundled: bool = True,
                  write_config_json: bool = True) -> dict:
     """Run one loader scenario in a fresh Hermes-venv process + temp home."""
     if not HERMES_PY.exists():
-        raise RuntimeError(f"Hermes venv python not found at {HERMES_PY}")
+        # Skip, don't fail: machines without a Hermes install run the fake
+        # suite only, same as the other two real_* modules.
+        msg = (
+            f"Hermes venv python not found at {HERMES_PY} "
+            "(set HERMES_AGENT_DIR or HERMES_PY)"
+        )
+        if "pytest" in sys.modules:  # running under pytest, not self-running
+            import pytest
+
+            pytest.skip(msg)
+        raise unittest.SkipTest(msg)
     temp_root = Path(tempfile.mkdtemp(prefix="aw_real_loader_"))
     spec = {
         "temp_root": str(temp_root),
@@ -580,6 +589,8 @@ def _selftest_main() -> int:
     for fn in tests:
         try:
             fn()
+        except unittest.SkipTest as exc:
+            print(f"SKIP {fn.__name__}: {exc}")
         except Exception as exc:  # noqa: BLE001
             failures += 1
             print(f"FAIL {fn.__name__}: {type(exc).__name__}: {exc}")
