@@ -11,7 +11,8 @@ the same prefilter, the same judge and the same send path — deliberately, sinc
 a second eligibility ladder would be the one that drifts, spends money and
 posts.
 
-Built and tested against **hermes-agent v0.20.0** (commit `c0106e5`).
+Built against **hermes-agent v0.20.0** (commit `c0106e5`); full suite
+re-verified against main `45af7a71` (2026-08-16), 439 tests passing.
 Design doc: see the "Ambient Mode for Hermes Agent" artifact (Parts 4–7).
 Parity audit against Anthropic's own Claude Tag spec: [PARITY.md](PARITY.md).
 
@@ -734,11 +735,16 @@ just `ambient_watch`, so asking the agent to poke at *any* plugin's private
 state gets a block with an explanation. That is a small, intentional loss of
 convenience; the block message says what to run instead.
 
-## Install (already done on this machine)
+## Install
 
-Plugin lives at `%LOCALAPPDATA%\hermes\plugins\ambient-watch` and shows in
-`hermes plugins list` as **not enabled** — it stays dormant and fail-closed
-until configured.
+```
+hermes plugins install sepivip/hermes-ambient-watch/ambient-watch
+```
+
+Then follow the [go-live runbook](#go-live-runbook). The plugin installs
+**not enabled** and stays dormant and fail-closed until configured. (On the
+development machine it already lives at
+`%LOCALAPPDATA%\hermes\plugins\ambient-watch`.)
 
 ## Status: verified live
 
@@ -1135,14 +1141,18 @@ look:
 ## Development
 
 ```
-.venv\Scripts\python -m pytest                      # 274 passed, 14 skipped (fakes only)
-PYTHONPATH=<hermes-agent> <hermes-venv>/python -m pytest   # 305 passed, incl. real runtime
+python -m pytest                                    # 394 passed, 28 skipped (fakes only)
+PYTHONPATH=<hermes-agent> <hermes-venv>/python -m pytest   # 439 passed, incl. real runtime
 ```
 
 Most tests use fakes of the verified v0.20.0 contracts (`tests/conftest.py`),
 so no Hermes install is needed to develop. `tests/test_real_*.py` drive the
 actual Hermes loader, `GatewayRunner._handle_message`, and
-`cron.scheduler._run_job_script` — they skip without Hermes importable.
+`cron.scheduler._run_job_script` — they find the install at
+`%LOCALAPPDATA%\hermes\hermes-agent` (override with `HERMES_AGENT_DIR` /
+`HERMES_PY`) and skip cleanly without one. On Windows the fakes suite also
+needs the `tzdata` package: without an OS tz database, `quiet_tz` falls back
+to UTC and every quiet-hours-sensitive test measures the wrong thing.
 
 **No test ever makes an LLM call or a Slack call.** The judge and the transport
 are injected (`run_gate(..., judge_fn=, transport=)`), and every config the
